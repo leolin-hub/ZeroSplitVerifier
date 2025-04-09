@@ -27,7 +27,7 @@ class ZeroSplitVerifier(RNN):
         self.debug = debug
         
     def _compute_basic_bounds(self, eps, p, v, X, N, s, n, idx_eps):
-        """計算基本的bounds
+        """計算當前timestep input的bounds
         
         Args:
             eps: float or Tensor, 擾動範圍
@@ -66,7 +66,7 @@ class ZeroSplitVerifier(RNN):
                 yU = yU + idx_eps[v-1] * eps.unsqueeze(1).expand(-1, s) * torch.norm(W_ax, p=q, dim=2)
                 yL = yL - idx_eps[v-1] * eps.unsqueeze(1).expand(-1, s) * torch.norm(W_ax, p=q, dim=2)
             else:
-                # eps是標量時的處理
+                # eps is a number
                 yU = yU + idx_eps[v-1] * eps * torch.norm(W_ax, p=q, dim=2)
                 yL = yL - idx_eps[v-1] * eps * torch.norm(W_ax, p=q, dim=2)
                 
@@ -81,14 +81,14 @@ class ZeroSplitVerifier(RNN):
             yL = yL + b_aa + b_ax  # [N, s]
             
             if self.debug:
-                print(f"\nTime step {v} basic bounds:")
-                print(f"Basic Lower bound range: {yL}")
-                print(f"Basic Upper bound range: {yU}")
+                print(f"\nCurrent Timestep {v} input impact:")
+                print(f"Current Timestep {v} input lower: {yL}")
+                print(f"Current Timestep {v} input upper: {yU}")
             
             return yU, yL
         
-    def computeHiddenBounds(self, eps, p, X = None, Eps_idx = None, problem_layer=None, merge_results=True, cross_zero=None):
-        """計算hidden layer的bounds"""
+    def computePreactivationBounds(self, eps, p, X = None, Eps_idx = None, problem_layer=None, merge_results=True, cross_zero=None):
+        """計算hidden layer的preactivation bounds"""
         if X is None:
             X = self.X
         
@@ -483,7 +483,7 @@ class ZeroSplitVerifier(RNN):
             top1_class = output.argmax(dim=1)  # [N]
 
         # 2. 計算bound
-        yL, yU = self.computeHiddenBounds(eps, p=2, X=X, 
+        yL, yU = self.computePreactivationBounds(eps, p=2, X=X, 
                                         Eps_idx=torch.arange(1,self.time_step+1))
         
         print(f"不做split的隱藏層bounds to verify: {yL}, {yU}")
@@ -562,7 +562,7 @@ class ZeroSplitVerifier(RNN):
         # 根據merge_results來決定是否要合併結果
         if merge_results:
             # 合併驗證(這裡回傳的是已經調用過computeLast2sideBound的結果)
-            yL_out, yU_out = self.computeHiddenBounds(
+            yL_out, yU_out = self.computePreactivationBounds(
                 eps, p=2, X=X, Eps_idx=torch.arange(1, self.time_step + 1),
                 problem_layer=unsafe_layer, merge_results=True, cross_zero=cross_zero
             )
@@ -661,7 +661,7 @@ def main():
 
     # 創建模型
     verifier = ZeroSplitVerifier(input_size, hidden_size, output_size, time_step, activation, max_splits=1, debug=False)
-    #verifier.load_state_dict(torch.load("C:/Users/LiLe556/Leo file/models/mnist_classifier/rnn_2_2_relu/rnn", map_location='cpu'))
+    #verifier.load_state_dict(torch.load("C:/Users/leolin9/POPQORN/models/mnist_classifier/rnn_2_2_relu/", map_location='cpu'))
     #verifier.to(device)
     
     # 手動設定toy RNN的權重
@@ -728,7 +728,7 @@ def main():
     print("\n=== 計算沒有分割的bounds ===")
     verifier.clear_intermediate_variables()
     
-    yL_hid, yU_hid = verifier.computeHiddenBounds(eps, p=2, X=X, Eps_idx=torch.arange(1, time_step+1))
+    yL_hid, yU_hid = verifier.computePreactivationBounds(eps, p=2, X=X, Eps_idx=torch.arange(1, time_step+1))
     
     # 計算第一個timestep的bounds
     print("\n第一個timestep的bounds:")
@@ -779,7 +779,7 @@ def main():
         
     
     # 原本單純去計算bounds(已確認成功)
-    # yL, yU = verifier.computeHiddenBounds(eps, p=2, v=1, X=X, Eps_idx=torch.arange(1, time_step+1))
+    # yL, yU = verifier.computePreactivationBounds(eps, p=2, v=1, X=X, Eps_idx=torch.arange(1, time_step+1))
     
     # # for k in range(1, time_step+1):
     # #     yU, yL = verifier.compute2sideBound(eps, p=2, v=k, X=X[:, 0:k, :], Eps_idx=torch.arange(1, time_step+1))
