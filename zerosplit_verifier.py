@@ -87,7 +87,7 @@ class ZeroSplitVerifier(RNN):
             
             return yU, yL
         
-    def computePreactivationBounds(self, eps, p, X = None, Eps_idx = None, problem_layer=None, merge_results=True, cross_zero=None):
+    def computePreactivationBounds(self, eps, p, X = None, Eps_idx = None, unsafe_layer=None, merge_results=True, cross_zero=None):
         """計算hidden layer的preactivation bounds"""
         if X is None:
             X = self.X
@@ -101,17 +101,17 @@ class ZeroSplitVerifier(RNN):
         # 依次計算每一層
         for v in range(1, self.time_step + 1):
             # 檢查是否已經執行過分割
-            if problem_layer is not None and v > problem_layer:
+            if unsafe_layer is not None and v > unsafe_layer:
                 split_done = True
                 
             yL, yU = self.compute2sideBound(
                 eps, p, v, X=X[:, 0:v, :], Eps_idx=Eps_idx,
-                problem_layer=problem_layer, merge_results=merge_results,
+                unsafe_layer=unsafe_layer, merge_results=merge_results,
                 split_done=split_done, cross_zero=cross_zero
             )
             
             # 如果是問題層並且不合併結果，返回兩個子問題的結果
-            if problem_layer == v and not merge_results:
+            if unsafe_layer == v and not merge_results:
                 return yL, yU  # 這裡的yL, yU實際上是兩個子問題的結果
             
             results.append((yL, yU))
@@ -119,7 +119,7 @@ class ZeroSplitVerifier(RNN):
         # 返回最後一層的結果
         return results[-1]
         
-    def compute2sideBound(self, eps, p, v, X = None, Eps_idx = None, problem_layer=None, merge_results=True, split_done=False, cross_zero=None):
+    def compute2sideBound(self, eps, p, v, X = None, Eps_idx = None, unsafe_layer=None, merge_results=True, split_done=False, cross_zero=None):
         # X here is of size [batch_size, layer_index m, input_size]
         #eps could be a real number, or a tensor of size N
         #p is a real number
@@ -177,17 +177,17 @@ class ZeroSplitVerifier(RNN):
             self.u[v] = yU
             
             # 檢查是否需要在current timestep進行split
-            if problem_layer == v and not split_done:
+            if unsafe_layer == v and not split_done:
                 if not merge_results:
                     # 不合併結果，分別計算兩個子問題
-                    return self._split_and_compute_separate(eps, p, v, X, Eps_idx, cross_zero)
+                    return self._split_and_compute_separate(eps, p, v, X, Eps_idx, cross_zero, unsafe_layer=unsafe_layer)
                 else:
                     # 合併結果
-                    return self._split_and_merge(eps, p, v, X, Eps_idx, cross_zero)
+                    return self._split_and_merge(eps, p, v, X, Eps_idx, cross_zero, unsafe_layer=unsafe_layer)
                 
             return yL, yU
         
-    def _split_and_compute_separate(self, eps, p, v, X, Eps_idx, cross_zero):
+    def _split_and_compute_separate(self, eps, p, v, X, Eps_idx, cross_zero=None, unsafe_layer=None):
         """分割當前層並分別計算兩個子問題"""
         # 保存原始bounds
         orig_l = self.l[v].clone().detach()
@@ -201,6 +201,7 @@ class ZeroSplitVerifier(RNN):
         neg_yL, neg_yU = None, None
         
         # 正區間: x >= 0
+        is_pos = True
         pos_l = orig_l.clone().detach()
         pos_u = orig_u.clone().detach()
         pos_l[cross_zero] = 0
@@ -223,7 +224,7 @@ class ZeroSplitVerifier(RNN):
         else:
             # v已經是最後一個隱藏層，直接計算輸出層
             pos_yL, pos_yU = self.computeLast2sideBound(
-                eps, p, v=self.time_step+1, X=X, Eps_idx=Eps_idx
+                eps, p, v=self.time_step+1, X=X, Eps_idx=Eps_idx, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
             )
             print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
             print(f"正區間的bounds差異: {pos_yU - pos_yL}")
@@ -263,11 +264,11 @@ class ZeroSplitVerifier(RNN):
         # 返回兩個子問題的最終結果
         return (pos_yL, pos_yU), (neg_yL, neg_yU)
     
-    def _split_and_merge(self, eps, p, v, X, Eps_idx, cross_zero):
+    def _split_and_merge(self, eps, p, v, X, Eps_idx, cross_zero=None, unsafe_layer=None):
         """分割當前層並合併兩個子問題的結果"""
         # 獲取分別計算的結果
         (pos_yL, pos_yU), (neg_yL, neg_yU) = self._split_and_compute_separate(
-            eps, p, v, X, Eps_idx, cross_zero
+            eps, p, v, X, Eps_idx, cross_zero=cross_zero, unsafe_layer=unsafe_layer
         )
         
         # 合併結果（取worst case）
@@ -279,7 +280,7 @@ class ZeroSplitVerifier(RNN):
         
         return yL, yU
         
-    def  computeLast2sideBound(self, eps, p, v, X=None, Eps_idx=None, problem_layer=None):
+    def  computeLast2sideBound(self, eps, p, v, X=None, Eps_idx=None, unsafe_layer=None, is_pos=False, cross_zero=None):
         with torch.no_grad():
             n = self.W_ax.shape[1] # input size
             s = self.W_ax.shape[0] # hidden size
@@ -310,7 +311,7 @@ class ZeroSplitVerifier(RNN):
             
             self.split_count = 0
             
-            yL, yU, A, Ou = self._recursive_bound_compute(v-1, v, eps, q, X, idx_eps, yL, yU, 0, is_last_layer=True)
+            yL, yU, A, Ou = self._recursive_bound_compute(v-1, v, eps, q, X, idx_eps, yL, yU, 0, is_last_layer=True, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero)
             
             # compute A^{<0>}
             A = torch.matmul(A,W_aa)  # (A^ {<1>} W_aa) * lambda^{<0>}
@@ -325,7 +326,7 @@ class ZeroSplitVerifier(RNN):
             
         
     def _recursive_bound_compute(self, k, v, eps, p, X, idx_eps, yL, yU, split_count, 
-                            is_last_layer=False, prev_A=None, prev_Ou=None):
+                            is_last_layer=False, prev_A=None, prev_Ou=None, unsafe_layer=None, is_pos=False, cross_zero=None):
         """處理 k from v-1 to 1的部分"""
         # 基本情況: k<1時停止遞歸
         if k < 1:
@@ -334,7 +335,7 @@ class ZeroSplitVerifier(RNN):
         # 正常處理，無需考慮分割
         cur_yL, cur_yU, A, Ou = self._compute_bounds_without_split(
             k, v, eps, p, X, yL, yU, idx_eps, is_last_layer, 
-            prev_A=prev_A, prev_Ou=prev_Ou
+            prev_A=prev_A, prev_Ou=prev_Ou, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
         )
         
         if k == 1:
@@ -342,10 +343,10 @@ class ZeroSplitVerifier(RNN):
         else:
             return self._recursive_bound_compute(
                 k-1, v, eps, p, X, idx_eps, cur_yL, cur_yU, split_count,
-                is_last_layer, prev_A=A, prev_Ou=Ou
+                is_last_layer, prev_A=A, prev_Ou=Ou, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
             )
     
-    def _compute_bounds_without_split(self, k, v, eps, p, X, yL, yU, idx_eps, is_last_layer=False, prev_A=None, prev_Ou=None):
+    def _compute_bounds_without_split(self, k, v, eps, p, X, yL, yU, idx_eps, is_last_layer=False, prev_A=None, prev_Ou=None, unsafe_layer=None, is_pos=False, cross_zero=None):
         """計算沒有split時的bounds
         Args:
             k: int, timestep
@@ -473,6 +474,10 @@ class ZeroSplitVerifier(RNN):
         ## third term
         yU = yU + torch.matmul(A,(b_aa+b_ax).view(N,s,1)).squeeze(2)+(A*Delta).sum(2)  # A^ {<k>} (b_a + Delta^{<k>})
         yL = yL + torch.matmul(Ou,(b_aa+b_ax).view(N,s,1)).squeeze(2)+(Ou*Theta).sum(2)  # Ou^ {<k>} (b_a + Theta^{<k>})
+
+        # 針對正區間的unsafe layer直接把下界assign為0
+        if is_last_layer and unsafe_layer is not None and is_pos:
+            yL[cross_zero] = 0
         
         return yL, yU, A, Ou
     
@@ -523,10 +528,10 @@ class ZeroSplitVerifier(RNN):
         # 如果有跨越0，就視為有violation需要split
         return cross_zero.any(), cross_zero
     
-    def locate_problematic_layer(self, X, eps):
+    def locate_unsafe_layer(self):
         """用Sequential(原為Binary) search找到第一個出現violation的layer(需要精進)"""
         
-        # 儲存每一層的bounds
+        # 儲存每一層的pre-activation bounds
         layer_bounds = []
         for k in range(1, self.time_step+1):
             layer_bounds.append((self.l[k], self.u[k]))
@@ -550,7 +555,7 @@ class ZeroSplitVerifier(RNN):
         #     return True, None, top1_class
             
         # 若驗證失敗，找出問題layer並進行split
-        unsafe_layer, cross_zero = self.locate_problematic_layer(X, eps)
+        unsafe_layer, cross_zero = self.locate_unsafe_layer()
         if unsafe_layer is None:
             return False, None, top1_class
         
@@ -564,7 +569,7 @@ class ZeroSplitVerifier(RNN):
             # 合併驗證(這裡回傳的是已經調用過computeLast2sideBound的結果)
             yL_out, yU_out = self.computePreactivationBounds(
                 eps, p=2, X=X, Eps_idx=torch.arange(1, self.time_step + 1),
-                problem_layer=unsafe_layer, merge_results=True, cross_zero=cross_zero
+                unsafe_layer=unsafe_layer, merge_results=True, cross_zero=cross_zero
             )
             
             # 計算最後一層
@@ -600,7 +605,7 @@ class ZeroSplitVerifier(RNN):
             (pos_bounds, neg_bounds) = self.compute2sideBound(
                 eps, p=2, v=unsafe_layer, X=X[:, 0:unsafe_layer, :], 
                 Eps_idx=torch.arange(1, self.time_step + 1),
-                problem_layer=unsafe_layer, merge_results=False, cross_zero=cross_zero
+                unsafe_layer=unsafe_layer, merge_results=False, cross_zero=cross_zero
             )
             
             # 從split_and_compute_separate獲取的結果格式為((pos_yL, pos_yU), (neg_yL, neg_yU))
