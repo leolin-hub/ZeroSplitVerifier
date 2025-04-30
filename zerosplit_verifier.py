@@ -476,7 +476,7 @@ class ZeroSplitVerifier(RNN):
         yL = yL + torch.matmul(Ou,(b_aa+b_ax).view(N,s,1)).squeeze(2)+(Ou*Theta).sum(2)  # Ou^ {<k>} (b_a + Theta^{<k>})
 
         # 針對正區間的unsafe layer直接把下界assign為0
-        if is_last_layer and unsafe_layer is not None and is_pos:
+        if is_last_layer and unsafe_layer == k and is_pos:
             yL[cross_zero] = 0
         
         return yL, yU, A, Ou
@@ -539,7 +539,7 @@ class ZeroSplitVerifier(RNN):
         # 依序檢查每一層
         for timestep in range(1, self.time_step+1):
             violation, cross_zero = self.has_violation(layer_bounds[timestep-1])
-            if violation and timestep != 1:
+            if violation:
                 return timestep, cross_zero
         
         # cross_zero here is belong to the current timestep, we use the previous timestep to abstract
@@ -656,9 +656,9 @@ def main():
     input_size = 2
     hidden_size = 2
     output_size = 2
-    time_step = 2
+    time_step = 1
     batch_size = 1
-    eps = 0.03
+    eps = 0.2
     activation = 'relu'
     device = torch.device('cpu')
     
@@ -666,8 +666,8 @@ def main():
 
     # 創建模型
     verifier = ZeroSplitVerifier(input_size, hidden_size, output_size, time_step, activation, max_splits=1, debug=False)
-    #verifier.load_state_dict(torch.load("C:/Users/leolin9/POPQORN/models/mnist_classifier/rnn_2_2_relu/", map_location='cpu'))
-    #verifier.to(device)
+    # verifier.load_state_dict(torch.load("C:/Users/leolin9/POPQORN/models/mnist_classifier/rnn_1_2_relu/rnn", map_location='cpu'))
+    # verifier.to(device)
     
     # 手動設定toy RNN的權重
     with torch.no_grad():
@@ -682,20 +682,20 @@ def main():
         
         # 隱藏層到隱藏層的權重
         verifier.W_aa = torch.tensor([
-            [1.0, 0.0],
-            [0.0, 1.0]
+            [0.5, 0.0],
+            [0.0, 0.5]
         ], dtype=torch.float32)
         
         # 隱藏層到輸出層的權重
         verifier.W_fa = torch.tensor([
-            [1.0, 0.0],
-            [0.0, 1.0]
+            [2.0, 0.0],
+            [0.0, 2.0]
         ], dtype=torch.float32)
         
         # Bias
-        verifier.b_ax = torch.tensor([0.05, -1.0], dtype=torch.float32)
-        verifier.b_aa = torch.tensor([0.0, -1.0], dtype=torch.float32)
-        verifier.b_f = torch.tensor([0.0, 0.0], dtype=torch.float32)
+        verifier.b_ax = torch.tensor([0.0, 0.0], dtype=torch.float32)
+        verifier.b_aa = torch.tensor([-1.0, 0.0], dtype=torch.float32)
+        verifier.b_f = torch.tensor([0.5, 0.0], dtype=torch.float32)
         
         def forward(self, X):
             with torch.no_grad():
@@ -706,67 +706,66 @@ def main():
                 pre_h = torch.matmul(X[:,0,:], self.W_ax.t()) + self.b_ax
                 h[:,1,:] = torch.relu(pre_h)
                 
-                # 第二個時間步
-                pre_h = torch.matmul(X[:,1,:], self.W_ax.t()) + self.b_ax + torch.matmul(h[:,1,:], self.W_aa.t())
-                h[:,2,:] = torch.relu(pre_h)
-                
                 # 輸出層
-                output = torch.matmul(h[:,2,:], self.W_fa.t()) + self.b_f
+                output = torch.matmul(h[:,1,:], self.W_fa.t()) + self.b_f
                 return output
         
         # 替換原本的forward方法
         verifier.forward = types.MethodType(forward, verifier)
         
+    # X = torch.tensor([
+    # [[0.1, 0.1], [-0.25, 0.3]]  # [batch_size=1, time_steps=2, features=2]
+    # ], dtype=torch.float32).to(device)
     X = torch.tensor([
-    [[0.1, 0.1], [-0.25, 0.3]]  # [batch_size=1, time_steps=2, features=2]
+    [[1.0, 1.0]]  # [batch_size=1, time_steps=1, features=2]
     ], dtype=torch.float32).to(device)
     
     print("輸入數據 X 形狀:", X.shape)
     print("輸入數據 X:", X)
     
-    with torch.no_grad():
-        output = verifier(X)
-        print("\n手動計算的輸出:", output)
-        top1_class = output.argmax(dim=1)
-        print("預測類別:", top1_class)
+    # with torch.no_grad():
+    #     output = verifier(X)
+    #     print("\n手動計算的輸出:", output)
+    #     top1_class = output.argmax(dim=1)
+    #     print("預測類別:", top1_class)
     
     print("\n=== 計算沒有分割的bounds ===")
     verifier.clear_intermediate_variables()
     
-    yL_hid, yU_hid = verifier.computePreactivationBounds(eps, p=2, X=X, Eps_idx=torch.arange(1, time_step+1))
+    # yL_hid, yU_hid = verifier.computePreactivationBounds(eps, p=2, X=X, Eps_idx=torch.arange(1, time_step+1))
     
-    # 計算第一個timestep的bounds
-    print("\n第一個timestep的bounds:")
-    print("第一Timestep的Lower bound:", verifier.l[1])
-    print("第一Timestep的Upper bound:", verifier.u[1])
+    # # 計算第一個timestep的bounds
+    # print("\n第一個timestep的bounds:")
+    # print("第一Timestep的Lower bound:", verifier.l[1])
+    # print("第一Timestep的Upper bound:", verifier.u[1])
     
-    # 計算第二個timestep的bounds
-    print("\n第二個timestep的bounds:")
-    print("第二Timestep的Lower bound:", verifier.l[2])
-    print("第二Timestep的Upper bound:", verifier.u[2])
+    # # 計算第二個timestep的bounds
+    # print("\n第二個timestep的bounds:")
+    # print("第二Timestep的Lower bound:", verifier.l[2])
+    # print("第二Timestep的Upper bound:", verifier.u[2])
     
-    # 計算最終輸出的bounds
-    print("\n計算最終輸出bounds:")
-    yL_out, yU_out = verifier.computeLast2sideBound(eps, p=2, v=time_step+1, X=X, Eps_idx=torch.arange(1, time_step+1))
-    print("輸出的Lower bound:", yL_out)
-    print("輸出的Upper bound:", yU_out)
+    # # 計算最終輸出的bounds
+    # print("\n計算最終輸出bounds:")
+    # yL_out, yU_out = verifier.computeLast2sideBound(eps, p=2, v=time_step+1, X=X, Eps_idx=torch.arange(1, time_step+1))
+    # print("輸出的Lower bound:", yL_out)
+    # print("輸出的Upper bound:", yU_out)
         
     # 抽樣data
     # X, y, target_label = sample_mnist_data(
     #     N=batch_size,
     #     seq_len=time_step,
     #     device=device,
-    #     data_dir='../../data/mnist',
+    #     data_dir='../data/mnist',
     #     train=False,
     #     shuffle=True,
     #     rnn=verifier
     # )
 
     # 創建驗證器
-    #verifier = ZeroSplitVerifier(input_size, hidden_size, output_size, time_step, activation, max_splits=3, debug=True)
+    # verifier = ZeroSplitVerifier(input_size, hidden_size, output_size, time_step, activation, max_splits=3, debug=True)
 
     # 提取權重用於bound計算
-    #verifier.extractWeight(clear_original_model=False)
+    # verifier.extractWeight(clear_original_model=False)
     
     
     ## 1. 分開驗證兩個子問題 (任一子問題驗證成功即整體成功)
