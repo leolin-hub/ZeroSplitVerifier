@@ -103,6 +103,7 @@ class ZeroSplitVerifier(RNN):
             # 檢查是否已經執行過分割
             if unsafe_layer is not None and v > unsafe_layer:
                 split_done = True
+                break
                 
             yL, yU = self.compute2sideBound(
                 eps, p, v, X=X[:, 0:v, :], Eps_idx=Eps_idx,
@@ -192,6 +193,7 @@ class ZeroSplitVerifier(RNN):
         # 保存原始bounds
         orig_l = self.l[v].clone().detach()
         orig_u = self.u[v].clone().detach()
+        full_X = self.original_X.clone().detach()
         
         if self.debug:
             print(f"Splitting layer {v}, cross_zero count: {cross_zero.sum().item()}")
@@ -214,17 +216,17 @@ class ZeroSplitVerifier(RNN):
             # 從v+1層開始計算到最後一個隱藏層
             for k in range(v+1, self.time_step+1):
                 pos_yL, pos_yU = self.compute2sideBound(
-                    eps, p, k, X=X[:, 0:k, :], Eps_idx=Eps_idx
+                    eps, p, k, X=full_X[:, 0:k, :], Eps_idx=Eps_idx
                 )
             
             # 計算輸出層
             pos_yL, pos_yU = self.computeLast2sideBound(
-                eps, p, v=self.time_step+1, X=X, Eps_idx=Eps_idx
+                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
             )
         else:
             # v已經是最後一個隱藏層，直接計算輸出層
             pos_yL, pos_yU = self.computeLast2sideBound(
-                eps, p, v=self.time_step+1, X=X, Eps_idx=Eps_idx, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
+                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
             )
             print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
             print(f"正區間的bounds差異: {pos_yU - pos_yL}")
@@ -242,17 +244,17 @@ class ZeroSplitVerifier(RNN):
             # 從v+1層開始計算到最後一個隱藏層
             for k in range(v+1, self.time_step+1):
                 neg_yL, neg_yU = self.compute2sideBound(
-                    eps, p, k, X=X[:, 0:k, :], Eps_idx=Eps_idx
+                    eps, p, k, X=full_X[:, 0:k, :], Eps_idx=Eps_idx
                 )
             
             # 計算輸出層
             neg_yL, neg_yU = self.computeLast2sideBound(
-                eps, p, v=self.time_step+1, X=X, Eps_idx=Eps_idx
+                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
             )
         else:
             # v已經是最後一個隱藏層，直接計算輸出層
             neg_yL, neg_yU = self.computeLast2sideBound(
-                eps, p, v=self.time_step+1, X=X, Eps_idx=Eps_idx
+                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
             )
             print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
             print(f"負區間的bounds差異: {neg_yU - neg_yL}")
@@ -477,7 +479,9 @@ class ZeroSplitVerifier(RNN):
 
         # 針對正區間的unsafe layer直接把下界assign為0
         if is_last_layer and unsafe_layer == k and is_pos:
-            yL[cross_zero] = 0
+            cross_zero_output = (yL < 0) & (yU > 0)
+            if cross_zero_output.any():
+                yL[cross_zero_output] = 0
         
         return yL, yU, A, Ou
     
@@ -548,6 +552,8 @@ class ZeroSplitVerifier(RNN):
     
     def verify_network(self, X, eps, max_splits=None, merge_results=False):
         """整體的驗證流程"""
+
+        self.original_X = X.clone().detach()
         
         # 第一次驗證，不做split
         is_verified, top1_class = self.verify_robustness(X, eps)
@@ -611,6 +617,10 @@ class ZeroSplitVerifier(RNN):
             # 從split_and_compute_separate獲取的結果格式為((pos_yL, pos_yU), (neg_yL, neg_yU))
             (pos_yL_out, pos_yU_out) = pos_bounds
             (neg_yL_out, neg_yU_out) = neg_bounds
+            print(f"正區間的final bounds: {pos_yL_out}, {pos_yU_out}")
+            print(f"正區間的bounds差異: {pos_yU_out - pos_yL_out}")
+            print(f"負區間的final bounds: {neg_yL_out}, {neg_yU_out}")
+            print(f"負區間的bounds差異: {neg_yU_out - neg_yL_out}")
             
             # 驗證兩個子問題
             N = X.shape[0]
@@ -656,7 +666,7 @@ def main():
     input_size = 2
     hidden_size = 2
     output_size = 2
-    time_step = 1
+    time_step = 2
     batch_size = 1
     eps = 0.2
     activation = 'relu'
@@ -705,20 +715,24 @@ def main():
                 # 第一個時間步
                 pre_h = torch.matmul(X[:,0,:], self.W_ax.t()) + self.b_ax
                 h[:,1,:] = torch.relu(pre_h)
+
+                # 第二個時間步
+                pre_h = torch.matmul(h[:,1,:], self.W_aa.t()) + self.b_aa
+                h[:,2,:] = torch.relu(pre_h)
                 
                 # 輸出層
-                output = torch.matmul(h[:,1,:], self.W_fa.t()) + self.b_f
+                output = torch.matmul(h[:,2,:], self.W_fa.t()) + self.b_f
                 return output
         
         # 替換原本的forward方法
         verifier.forward = types.MethodType(forward, verifier)
         
-    # X = torch.tensor([
-    # [[0.1, 0.1], [-0.25, 0.3]]  # [batch_size=1, time_steps=2, features=2]
-    # ], dtype=torch.float32).to(device)
     X = torch.tensor([
-    [[1.0, 1.0]]  # [batch_size=1, time_steps=1, features=2]
+    [[0.1, 0.1], [-0.25, 0.3]]  # [batch_size=1, time_steps=2, features=2]
     ], dtype=torch.float32).to(device)
+    # X = torch.tensor([
+    # [[1.0, 1.0]]  # [batch_size=1, time_steps=1, features=2]
+    # ], dtype=torch.float32).to(device)
     
     print("輸入數據 X 形狀:", X.shape)
     print("輸入數據 X:", X)
@@ -770,7 +784,7 @@ def main():
     
     ## 1. 分開驗證兩個子問題 (任一子問題驗證成功即整體成功)
     print("\n=== 分開驗證子問題模式 ===")
-    is_verified, unsafe_layer, top1_class = verifier.verify_network(X, eps, merge_results=True)
+    is_verified, unsafe_layer, top1_class = verifier.verify_network(X, eps)
     
     print("\n=== 驗證結果 ===")
     print(f"原始預測類別: {top1_class}")
