@@ -223,6 +223,8 @@ class ZeroSplitVerifier(RNN):
             pos_yL, pos_yU = self.computeLast2sideBound(
                 eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
             )
+            print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
+            print(f"正區間的bounds差異: {pos_yU - pos_yL}")
         else:
             # v已經是最後一個隱藏層，直接計算輸出層
             pos_yL, pos_yU = self.computeLast2sideBound(
@@ -251,6 +253,8 @@ class ZeroSplitVerifier(RNN):
             neg_yL, neg_yU = self.computeLast2sideBound(
                 eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
             )
+            print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
+            print(f"負區間的bounds差異: {neg_yU - neg_yL}")
         else:
             # v已經是最後一個隱藏層，直接計算輸出層
             neg_yL, neg_yU = self.computeLast2sideBound(
@@ -468,8 +472,9 @@ class ZeroSplitVerifier(RNN):
                 yL = yL - idx_eps[k-1]*eps.unsqueeze(1).expand(-1,
                             s)*torch.norm(torch.matmul(Ou,W_ax),p=p,dim=2)  # eps ||Ou^ {<k>} W_ax||q      
         else:
-            yU = yU + idx_eps[k-1]*eps*torch.norm(torch.matmul(A,W_ax),p=p,dim=2)  # eps ||A^ {<k>} W_ax||q    
-            yL = yL - idx_eps[k-1]*eps*torch.norm(torch.matmul(Ou,W_ax),p=p,dim=2)  # eps ||Ou^ {<k>} W_ax||q  
+            yU = yU + idx_eps[k-1]*eps*torch.norm(torch.matmul(A,W_ax),p=p,dim=2)  # eps ||A^ {<k>} W_ax||q   
+            if unsafe_layer != k: 
+                yL = yL - idx_eps[k-1]*eps*torch.norm(torch.matmul(Ou,W_ax),p=p,dim=2)  # eps ||Ou^ {<k>} W_ax||q  
         ## second term
         yU = yU + torch.matmul(A,torch.matmul(W_ax,X[:,k-1,:].view(N,n,1))).squeeze(2)  # A^ {<k>} W_ax x^{<k>}            
         yL = yL + torch.matmul(Ou,torch.matmul(W_ax,X[:,k-1,:].view(N,n,1))).squeeze(2)  # Ou^ {<k>} W_ax x^{<k>}       
@@ -478,10 +483,10 @@ class ZeroSplitVerifier(RNN):
         yL = yL + torch.matmul(Ou,(b_aa+b_ax).view(N,s,1)).squeeze(2)+(Ou*Theta).sum(2)  # Ou^ {<k>} (b_a + Theta^{<k>})
 
         # 針對正區間的unsafe layer直接把下界assign為0
-        if is_last_layer and unsafe_layer == k and is_pos:
-            cross_zero_output = (yL < 0) & (yU > 0)
-            if cross_zero_output.any():
-                yL[cross_zero_output] = 0
+        # if is_last_layer and unsafe_layer == k and is_pos:
+        #     cross_zero_output = (yL < 0) & (yU > 0)
+        #     if cross_zero_output.any():
+        #         yL[cross_zero_output] = 0
         
         return yL, yU, A, Ou
     
@@ -705,7 +710,7 @@ def main():
         # Bias
         verifier.b_ax = torch.tensor([0.0, 0.0], dtype=torch.float32)
         verifier.b_aa = torch.tensor([-1.0, 0.0], dtype=torch.float32)
-        verifier.b_f = torch.tensor([0.5, 0.0], dtype=torch.float32)
+        verifier.b_f = torch.tensor([0.0, 0.0], dtype=torch.float32)
         
         def forward(self, X):
             with torch.no_grad():
@@ -784,7 +789,7 @@ def main():
     
     ## 1. 分開驗證兩個子問題 (任一子問題驗證成功即整體成功)
     print("\n=== 分開驗證子問題模式 ===")
-    is_verified, unsafe_layer, top1_class = verifier.verify_network(X, eps)
+    is_verified, unsafe_layer, top1_class = verifier.verify_network(X, eps, merge_results=True)
     
     print("\n=== 驗證結果 ===")
     print(f"原始預測類別: {top1_class}")
