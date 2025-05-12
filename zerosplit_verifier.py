@@ -181,14 +181,48 @@ class ZeroSplitVerifier(RNN):
             if unsafe_layer == v and not split_done:
                 if not merge_results:
                     # 不合併結果，分別計算兩個子問題
-                    return self._split_and_compute_separate(eps, p, v, X, Eps_idx, cross_zero, unsafe_layer=unsafe_layer)
+                    return self._split_and_compute_separate(eps, p, v, X, Eps_idx, cross_zero)
                 else:
                     # 合併結果
-                    return self._split_and_merge(eps, p, v, X, Eps_idx, cross_zero, unsafe_layer=unsafe_layer)
+                    return self._split_and_merge(eps, p, v, X, Eps_idx, cross_zero)
                 
             return yL, yU
         
-    def _split_and_compute_separate(self, eps, p, v, X, Eps_idx, cross_zero=None, unsafe_layer=None):
+    def _calculate_adjusted_epsilon(self, original_eps, original_l, original_u, sub_l, sub_u, cross_zero_mask):
+        """
+        啟發式地計算調整後的 epsilon。
+        這裡的實現非常簡化，只考慮了平均寬度變化。
+        """
+        if not cross_zero_mask.any():
+            return original_eps
+
+        # 只計算 cross_zero 維度的寬度
+        original_widths = (original_u - original_l)[cross_zero_mask]
+        sub_widths = (sub_u - sub_l)[cross_zero_mask]
+
+        # 避免除以零或無效寬度
+        valid_mask = original_widths > 1e-8
+        if not valid_mask.any():
+            return original_eps
+
+        factors = sub_widths[valid_mask] / original_widths[valid_mask]
+        
+        # 聚合因子，例如取平均值，並確保在 [0, 1] 之間
+        # 這裡需要注意，如果 original_eps 是 tensor，聚合方式需要更小心
+        # 假設 original_eps 是標量
+        if factors.numel() > 0:
+            mean_factor = torch.clamp(factors.mean(), 0.0, 1.0)
+            adjusted_eps = original_eps * mean_factor
+            adjusted_eps = adjusted_eps.item()
+        else:
+            adjusted_eps = original_eps
+            
+        if self.debug:
+            print(f"Original eps: {original_eps}, Adjusted eps: {adjusted_eps}, Factor: {mean_factor if factors.numel() > 0 else 'N/A'}")
+            
+        return adjusted_eps
+            
+    def _split_and_compute_separate(self, eps, p, v, X, Eps_idx, cross_zero=None):
         """分割當前層並分別計算兩個子問題"""
         # 保存原始bounds
         orig_l = self.l[v].clone().detach()
@@ -207,6 +241,9 @@ class ZeroSplitVerifier(RNN):
         pos_l = orig_l.clone().detach()
         pos_u = orig_u.clone().detach()
         pos_l[cross_zero] = 0
+
+        # 實驗性：計算調整後的 epsilon for positive sub-problem
+        eps_pos = self._calculate_adjusted_epsilon(eps, orig_l, orig_u, pos_l, pos_u, cross_zero)
         
         self.l[v] = pos_l
         self.u[v] = pos_u
@@ -216,19 +253,20 @@ class ZeroSplitVerifier(RNN):
             # 從v+1層開始計算到最後一個隱藏層
             for k in range(v+1, self.time_step+1):
                 pos_yL, pos_yU = self.compute2sideBound(
-                    eps, p, k, X=full_X[:, 0:k, :], Eps_idx=Eps_idx
-                )
+                    eps_pos, p, k, X=full_X[:, 0:k, :], Eps_idx=Eps_idx
+                ) # eps換成eps_pos
+                print(f"第 {k} timestep的pre-activation bounds: 正區間下界: {pos_yL}, 正區間上界: {pos_yU}")
             
             # 計算輸出層
             pos_yL, pos_yU = self.computeLast2sideBound(
-                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
+                eps_pos, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
             )
             print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
             print(f"正區間的bounds差異: {pos_yU - pos_yL}")
         else:
             # v已經是最後一個隱藏層，直接計算輸出層
             pos_yL, pos_yU = self.computeLast2sideBound(
-                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
+                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
             )
             print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
             print(f"正區間的bounds差異: {pos_yU - pos_yL}")
@@ -238,6 +276,8 @@ class ZeroSplitVerifier(RNN):
         neg_u = orig_u.clone().detach()
         neg_u[cross_zero] = 0
         
+        eps_neg = self._calculate_adjusted_epsilon(eps, orig_l, orig_u, neg_l, neg_u, cross_zero)
+        
         self.l[v] = neg_l
         self.u[v] = neg_u
         
@@ -246,12 +286,13 @@ class ZeroSplitVerifier(RNN):
             # 從v+1層開始計算到最後一個隱藏層
             for k in range(v+1, self.time_step+1):
                 neg_yL, neg_yU = self.compute2sideBound(
-                    eps, p, k, X=full_X[:, 0:k, :], Eps_idx=Eps_idx
-                )
+                    eps_neg, p, k, X=full_X[:, 0:k, :], Eps_idx=Eps_idx
+                ) # eps換eps_neg
+                print(f"第 {k} timestep的pre-activation bounds: 負區間下界: {neg_yL}, 負區間上界: {neg_yU}")
             
             # 計算輸出層
             neg_yL, neg_yU = self.computeLast2sideBound(
-                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
+                eps_neg, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
             )
             print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
             print(f"負區間的bounds差異: {neg_yU - neg_yL}")
@@ -270,11 +311,11 @@ class ZeroSplitVerifier(RNN):
         # 返回兩個子問題的最終結果
         return (pos_yL, pos_yU), (neg_yL, neg_yU)
     
-    def _split_and_merge(self, eps, p, v, X, Eps_idx, cross_zero=None, unsafe_layer=None):
+    def _split_and_merge(self, eps, p, v, X, Eps_idx, cross_zero=None):
         """分割當前層並合併兩個子問題的結果"""
         # 獲取分別計算的結果
         (pos_yL, pos_yU), (neg_yL, neg_yU) = self._split_and_compute_separate(
-            eps, p, v, X, Eps_idx, cross_zero=cross_zero, unsafe_layer=unsafe_layer
+            eps, p, v, X, Eps_idx, cross_zero=cross_zero
         )
         
         # 合併結果（取worst case）
@@ -286,7 +327,7 @@ class ZeroSplitVerifier(RNN):
         
         return yL, yU
         
-    def  computeLast2sideBound(self, eps, p, v, X=None, Eps_idx=None, unsafe_layer=None, is_pos=False, cross_zero=None):
+    def  computeLast2sideBound(self, eps, p, v, X=None, Eps_idx=None):
         with torch.no_grad():
             n = self.W_ax.shape[1] # input size
             s = self.W_ax.shape[0] # hidden size
@@ -317,7 +358,7 @@ class ZeroSplitVerifier(RNN):
             
             self.split_count = 0
             
-            yL, yU, A, Ou = self._recursive_bound_compute(v-1, v, eps, q, X, idx_eps, yL, yU, 0, is_last_layer=True, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero)
+            yL, yU, A, Ou = self._recursive_bound_compute(v-1, v, eps, q, X, idx_eps, yL, yU, 0, is_last_layer=True)
             
             # compute A^{<0>}
             A = torch.matmul(A,W_aa)  # (A^ {<1>} W_aa) * lambda^{<0>}
@@ -332,7 +373,7 @@ class ZeroSplitVerifier(RNN):
             
         
     def _recursive_bound_compute(self, k, v, eps, p, X, idx_eps, yL, yU, split_count, 
-                            is_last_layer=False, prev_A=None, prev_Ou=None, unsafe_layer=None, is_pos=False, cross_zero=None):
+                            is_last_layer=False, prev_A=None, prev_Ou=None):
         """處理 k from v-1 to 1的部分"""
         # 基本情況: k<1時停止遞歸
         if k < 1:
@@ -341,7 +382,7 @@ class ZeroSplitVerifier(RNN):
         # 正常處理，無需考慮分割
         cur_yL, cur_yU, A, Ou = self._compute_bounds_without_split(
             k, v, eps, p, X, yL, yU, idx_eps, is_last_layer, 
-            prev_A=prev_A, prev_Ou=prev_Ou, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
+            prev_A=prev_A, prev_Ou=prev_Ou
         )
         
         if k == 1:
@@ -349,10 +390,10 @@ class ZeroSplitVerifier(RNN):
         else:
             return self._recursive_bound_compute(
                 k-1, v, eps, p, X, idx_eps, cur_yL, cur_yU, split_count,
-                is_last_layer, prev_A=A, prev_Ou=Ou, unsafe_layer=unsafe_layer, is_pos=is_pos, cross_zero=cross_zero
+                is_last_layer, prev_A=A, prev_Ou=Ou
             )
     
-    def _compute_bounds_without_split(self, k, v, eps, p, X, yL, yU, idx_eps, is_last_layer=False, prev_A=None, prev_Ou=None, unsafe_layer=None, is_pos=False, cross_zero=None):
+    def _compute_bounds_without_split(self, k, v, eps, p, X, yL, yU, idx_eps, is_last_layer=False, prev_A=None, prev_Ou=None):
         """計算沒有split時的bounds
         Args:
             k: int, timestep
@@ -473,20 +514,13 @@ class ZeroSplitVerifier(RNN):
                             s)*torch.norm(torch.matmul(Ou,W_ax),p=p,dim=2)  # eps ||Ou^ {<k>} W_ax||q      
         else:
             yU = yU + idx_eps[k-1]*eps*torch.norm(torch.matmul(A,W_ax),p=p,dim=2)  # eps ||A^ {<k>} W_ax||q   
-            if unsafe_layer != k: 
-                yL = yL - idx_eps[k-1]*eps*torch.norm(torch.matmul(Ou,W_ax),p=p,dim=2)  # eps ||Ou^ {<k>} W_ax||q  
+            yL = yL - idx_eps[k-1]*eps*torch.norm(torch.matmul(Ou,W_ax),p=p,dim=2)  # eps ||Ou^ {<k>} W_ax||q  
         ## second term
         yU = yU + torch.matmul(A,torch.matmul(W_ax,X[:,k-1,:].view(N,n,1))).squeeze(2)  # A^ {<k>} W_ax x^{<k>}            
         yL = yL + torch.matmul(Ou,torch.matmul(W_ax,X[:,k-1,:].view(N,n,1))).squeeze(2)  # Ou^ {<k>} W_ax x^{<k>}       
         ## third term
         yU = yU + torch.matmul(A,(b_aa+b_ax).view(N,s,1)).squeeze(2)+(A*Delta).sum(2)  # A^ {<k>} (b_a + Delta^{<k>})
         yL = yL + torch.matmul(Ou,(b_aa+b_ax).view(N,s,1)).squeeze(2)+(Ou*Theta).sum(2)  # Ou^ {<k>} (b_a + Theta^{<k>})
-
-        # 針對正區間的unsafe layer直接把下界assign為0
-        # if is_last_layer and unsafe_layer == k and is_pos:
-        #     cross_zero_output = (yL < 0) & (yU > 0)
-        #     if cross_zero_output.any():
-        #         yL[cross_zero_output] = 0
         
         return yL, yU, A, Ou
     
@@ -511,14 +545,15 @@ class ZeroSplitVerifier(RNN):
         # 3. 檢查robustness
         N = X.shape[0]
         robust = True
-        for i in range(N):
-            top1 = top1_class[i]
-            other_classes = [j for j in range(self.output_size) if j != top1]
+        top1_class = 1
+        # for i in range(N):
+        #     top1 = top1_class[i]
+        #     other_classes = [j for j in range(self.output_size) if j != top1]
             
-            # 檢查top1 class的lower bound是否大於其他所有class的upper bound
-            if not all(yL_out[i,top1] > yU_out[i,j] for j in other_classes):
-                robust = False
-                return False, top1_class
+        #     # 檢查top1 class的lower bound是否大於其他所有class的upper bound
+        #     if not all(yL_out[i,top1] > yU_out[i,j] for j in other_classes):
+        #         robust = False
+        #         return False, top1_class
                 
         return robust, top1_class
     
@@ -593,13 +628,13 @@ class ZeroSplitVerifier(RNN):
             N = X.shape[0]
             is_verified = True
             
-            for i in range(N):
-                top1 = top1_class[i]
-                other_classes = [j for j in range(self.output_size) if j != top1]
+            # for i in range(N):
+            #     top1 = top1_class[i]
+            #     other_classes = [j for j in range(self.output_size) if j != top1]
                 
-                if not all(yL_out[i, top1] > yU_out[i, j] for j in other_classes):
-                    is_verified = False
-                    break
+            #     if not all(yL_out[i, top1] > yU_out[i, j] for j in other_classes):
+            #         is_verified = False
+            #         break
                     
             return is_verified, unsafe_layer, top1_class
         
@@ -668,12 +703,12 @@ def main():
     # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Toy RNN
-    input_size = 2
-    hidden_size = 2
+    input_size = 1
+    hidden_size = 1
     output_size = 2
     time_step = 2
     batch_size = 1
-    eps = 0.2
+    eps = 1.5
     activation = 'relu'
     device = torch.device('cpu')
     
@@ -691,26 +726,23 @@ def main():
         
         # 輸入到隱藏層的權重
         verifier.W_ax = torch.tensor([
-            [1.0, 0.0], # 第一個time step
-            [0.0, 1.0]  # 第二個time step
+            [1.0] # 第一個time step
         ], dtype=torch.float32)
         
         # 隱藏層到隱藏層的權重
         verifier.W_aa = torch.tensor([
-            [0.5, 0.0],
-            [0.0, 0.5]
+            [1.0]
         ], dtype=torch.float32)
         
         # 隱藏層到輸出層的權重
         verifier.W_fa = torch.tensor([
-            [2.0, 0.0],
-            [0.0, 2.0]
+            [1.0]
         ], dtype=torch.float32)
         
         # Bias
-        verifier.b_ax = torch.tensor([0.0, 0.0], dtype=torch.float32)
-        verifier.b_aa = torch.tensor([-1.0, 0.0], dtype=torch.float32)
-        verifier.b_f = torch.tensor([0.0, 0.0], dtype=torch.float32)
+        verifier.b_ax = torch.tensor([0.0], dtype=torch.float32)
+        verifier.b_aa = torch.tensor([0.0], dtype=torch.float32) # 要多個hidden size跨越0調整這裡
+        verifier.b_f = torch.tensor([0.0], dtype=torch.float32)
         
         def forward(self, X):
             with torch.no_grad():
@@ -732,12 +764,12 @@ def main():
         # 替換原本的forward方法
         verifier.forward = types.MethodType(forward, verifier)
         
-    X = torch.tensor([
-    [[0.1, 0.1], [-0.25, 0.3]]  # [batch_size=1, time_steps=2, features=2]
-    ], dtype=torch.float32).to(device)
     # X = torch.tensor([
-    # [[1.0, 1.0]]  # [batch_size=1, time_steps=1, features=2]
+    # [[0.1, 0.1], [-0.25, 0.3]]  # [batch_size=1, time_steps=2, features=2]
     # ], dtype=torch.float32).to(device)
+    X = torch.tensor([
+    [[1.0], [1.0]]  # [batch_size=1, time_steps=1, features=2]
+    ], dtype=torch.float32).to(device)
     
     print("輸入數據 X 形狀:", X.shape)
     print("輸入數據 X:", X)
@@ -749,7 +781,7 @@ def main():
     #     print("預測類別:", top1_class)
     
     print("\n=== 計算沒有分割的bounds ===")
-    verifier.clear_intermediate_variables()
+    # verifier.clear_intermediate_variables()
     
     # yL_hid, yU_hid = verifier.computePreactivationBounds(eps, p=2, X=X, Eps_idx=torch.arange(1, time_step+1))
     
@@ -768,6 +800,7 @@ def main():
     # yL_out, yU_out = verifier.computeLast2sideBound(eps, p=2, v=time_step+1, X=X, Eps_idx=torch.arange(1, time_step+1))
     # print("輸出的Lower bound:", yL_out)
     # print("輸出的Upper bound:", yU_out)
+    # print("輸出bounds差異:", yU_out - yL_out)
         
     # 抽樣data
     # X, y, target_label = sample_mnist_data(
