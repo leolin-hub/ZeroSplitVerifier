@@ -188,39 +188,77 @@ class ZeroSplitVerifier(RNN):
                 
             return yL, yU
         
-    def _calculate_adjusted_epsilon(self, original_eps, original_l, original_u, sub_l, sub_u, cross_zero_mask):
+    def adjust_eps_input_for_split(self, original_eps, X, v, sub_l, sub_u, cross_zero_mask, is_pos=True):
         """
-        啟發式地計算調整後的 epsilon。
-        這裡的實現非常簡化，只考慮了平均寬度變化。
+        對切分的該層與維度的input調整至中心位置，epsilon即為以新input為中心的擾動範圍
         """
+        new_X = X.clone().detach()
+
+        timestep = v - 1
+
         if not cross_zero_mask.any():
-            return original_eps
+            return X, original_eps
 
-        # 只計算 cross_zero 維度的寬度
-        original_widths = (original_u - original_l)[cross_zero_mask]
-        sub_widths = (sub_u - sub_l)[cross_zero_mask]
-
-        # 避免除以零或無效寬度
-        valid_mask = original_widths > 1e-8
-        if not valid_mask.any():
-            return original_eps
-
-        factors = sub_widths[valid_mask] / original_widths[valid_mask]
+        W_ax = self.W_ax # Input weights matrix [hidden size, input_size]
+        new_eps_values = []
         
-        # 聚合因子，例如取平均值，並確保在 [0, 1] 之間
-        # 這裡需要注意，如果 original_eps 是 tensor，聚合方式需要更小心
-        # 假設 original_eps 是標量
-        if factors.numel() > 0:
-            mean_factor = torch.clamp(factors.mean(), 0.0, 1.0)
-            adjusted_eps = original_eps * mean_factor
-            adjusted_eps = adjusted_eps.item()
-        else:
-            adjusted_eps = original_eps
-            
-        if self.debug:
-            print(f"Original eps: {original_eps}, Adjusted eps: {adjusted_eps}, Factor: {mean_factor if factors.numel() > 0 else 'N/A'}")
-            
-        return adjusted_eps
+        # Iterate each batch
+        batch_size = X.shape[0]
+        hidden_size = cross_zero_mask.shape[1]
+
+        for batch_idx in range(batch_size):
+            for neuron_idx in range(hidden_size):
+                if cross_zero_mask[batch_idx, neuron_idx]:
+                    # Retrieve the lower and upper bounds for the splitted neuron
+                    l_val = sub_l[batch_idx, neuron_idx].item()
+                    u_val = sub_u[batch_idx, neuron_idx].item()
+
+                    # Choose the midpoint based on the positive region or negative region
+                    target_mid = u_val / 2.0 if is_pos else l_val / 2.0
+
+                    # Weights Analysis - find the neuron with the most significant weight
+                    # Mathematical: (dy)/(dx_i) = W_ax[neuron_idx, i]
+                    # Choose the biggest influence made neuron in |W_ax[neuron_idx, :]|, since small change can cause large change in pre-activation
+                    weight_to_neuron = W_ax[neuron_idx, :] # Weight on that neuron [input_size]
+                    max_weight_idx = torch.argmax(torch.abs(weight_to_neuron)) # The index of the input with the largest weight
+
+                    # y_pre = W_ax[neuron_idx, :] @ x + b_total
+                    # Note: RNN bias is split into two parts: b_ax and b_aa
+                    total_bias = self.b_ax[neuron_idx] + self.b_aa[neuron_idx]
+
+                    # Inverse Solution - Calculate the required input adjustments
+                    # Mathematical: To be solved: W_ax[neuron_idx, max_idx] * delta_x = delta_y
+                    # delta_y = target_mid - current_pre_act
+                    current_pre_act = (weight_to_neuron @ X[batch_idx, timestep, :] + total_bias)
+                    needed_change = target_mid - current_pre_act
+
+                    if weight_to_neuron[max_weight_idx] != 0:
+                        # Linear inverse solution: Delta_x = delta_y / W[max_weight_idx]
+                        input_change = needed_change / weight_to_neuron[max_weight_idx].item()
+                        new_X[batch_idx, timestep, max_weight_idx] += input_change
+
+                        # 對此neuron計算epsilon
+                        # Need to cover the distance from the midpoint to the bounds
+                        weight_abs = torch.abs(weight_to_neuron[max_weight_idx]).item()
+                        if is_pos:
+                            # Perturbation in input: pre-activation change / (absolute weight)
+                            eps_needed = (u_val - target_mid) / weight_abs
+                        else:
+                            eps_needed = (target_mid - l_val) / weight_abs
+                        new_eps_values.append(eps_needed)
+
+                    
+        # 取最保守epsilon
+        # Conservatism - choose the smallest epsilon
+        # Make sure all adjusted inputs are within bounds
+        new_eps = min(new_eps_values) if new_eps_values else original_eps
+        # 計算新的epsilon (簡單情況)
+        # if is_pos:
+        #     new_eps = (torch.max(sub_u[cross_zero_mask]) / 2.0).item()
+        # else:
+        #     new_eps = (torch.max(torch.abs(sub_l[cross_zero_mask])) / 2.0).item()
+
+        return new_X, new_eps
             
     def _split_and_compute_separate(self, eps, p, v, X, Eps_idx, cross_zero=None):
         """分割當前層並分別計算兩個子問題"""
@@ -243,7 +281,7 @@ class ZeroSplitVerifier(RNN):
         pos_l[cross_zero] = 0
 
         # 實驗性：計算調整後的 epsilon for positive sub-problem
-        eps_pos = self._calculate_adjusted_epsilon(eps, orig_l, orig_u, pos_l, pos_u, cross_zero)
+        X_pos, eps_pos = self.adjust_eps_input_for_split(eps, full_X, v, pos_l, pos_u, cross_zero)
         
         self.l[v] = pos_l
         self.u[v] = pos_u
@@ -253,20 +291,20 @@ class ZeroSplitVerifier(RNN):
             # 從v+1層開始計算到最後一個隱藏層
             for k in range(v+1, self.time_step+1):
                 pos_yL, pos_yU = self.compute2sideBound(
-                    eps_pos, p, k, X=full_X[:, 0:k, :], Eps_idx=Eps_idx
+                    eps_pos, p, k, X=X_pos[:, 0:k, :], Eps_idx=Eps_idx
                 ) # eps換成eps_pos
                 print(f"第 {k} timestep的pre-activation bounds: 正區間下界: {pos_yL}, 正區間上界: {pos_yU}")
             
             # 計算輸出層
             pos_yL, pos_yU = self.computeLast2sideBound(
-                eps_pos, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
+                eps_pos, p, v=self.time_step+1, X=X_pos, Eps_idx=Eps_idx
             )
             print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
             print(f"正區間的bounds差異: {pos_yU - pos_yL}")
         else:
             # v已經是最後一個隱藏層，直接計算輸出層
             pos_yL, pos_yU = self.computeLast2sideBound(
-                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
+                eps_pos, p, v=self.time_step+1, X=X_pos, Eps_idx=Eps_idx
             )
             print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
             print(f"正區間的bounds差異: {pos_yU - pos_yL}")
@@ -276,7 +314,7 @@ class ZeroSplitVerifier(RNN):
         neg_u = orig_u.clone().detach()
         neg_u[cross_zero] = 0
         
-        eps_neg = self._calculate_adjusted_epsilon(eps, orig_l, orig_u, neg_l, neg_u, cross_zero)
+        X_neg, eps_neg = self.adjust_eps_input_for_split(eps, full_X, v, neg_l, neg_u, cross_zero, is_pos=False)
         
         self.l[v] = neg_l
         self.u[v] = neg_u
@@ -286,20 +324,20 @@ class ZeroSplitVerifier(RNN):
             # 從v+1層開始計算到最後一個隱藏層
             for k in range(v+1, self.time_step+1):
                 neg_yL, neg_yU = self.compute2sideBound(
-                    eps_neg, p, k, X=full_X[:, 0:k, :], Eps_idx=Eps_idx
+                    eps_neg, p, k, X=X_neg[:, 0:k, :], Eps_idx=Eps_idx
                 ) # eps換eps_neg
                 print(f"第 {k} timestep的pre-activation bounds: 負區間下界: {neg_yL}, 負區間上界: {neg_yU}")
             
             # 計算輸出層
             neg_yL, neg_yU = self.computeLast2sideBound(
-                eps_neg, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
+                eps_neg, p, v=self.time_step+1, X=X_neg, Eps_idx=Eps_idx
             )
             print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
             print(f"負區間的bounds差異: {neg_yU - neg_yL}")
         else:
             # v已經是最後一個隱藏層，直接計算輸出層
             neg_yL, neg_yU = self.computeLast2sideBound(
-                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
+                eps_neg, p, v=self.time_step+1, X=X_neg, Eps_idx=Eps_idx
             )
             print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
             print(f"負區間的bounds差異: {neg_yU - neg_yL}")
@@ -731,7 +769,7 @@ def main():
         
         # 隱藏層到隱藏層的權重
         verifier.W_aa = torch.tensor([
-            [1.0]
+            [0.0]
         ], dtype=torch.float32)
         
         # 隱藏層到輸出層的權重
