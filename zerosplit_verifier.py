@@ -268,14 +268,18 @@ class ZeroSplitVerifier(RNN):
 
                     # 扣除累積影響
                     hidden_contribution = W_aa[neuron_idx, :] @ h_prev[batch_idx, :]
-                    accumulated_effect = (hidden_contribution + self.b_aa[neuron_idx]).item()
+                    total_bias = self.b_ax[neuron_idx] + self.b_aa[neuron_idx]
+                    accumulated_effect = (hidden_contribution + total_bias).item()
 
                     # 純輸入影響的範圍：扣除累積影響
                     pure_input_l = l_val - accumulated_effect
                     pure_input_u = u_val - accumulated_effect
 
                     # Choose the midpoint based on the positive region or negative region
-                    target_mid = u_val / 2.0 if is_pos else l_val / 2.0
+                    if is_pos:
+                        target_mid = pure_input_u / 2.0
+                    else:
+                        target_mid = pure_input_l / 2.0
 
                     # Weights Analysis - find the neuron with the most significant weight
                     # Mathematical: (dy)/(dx_i) = W_ax[neuron_idx, i]
