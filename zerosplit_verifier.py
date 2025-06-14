@@ -4,6 +4,8 @@ from bound_vanilla_rnn import RNN
 from typing import Tuple, Optional, List
 import torch.nn as nn
 from dataclasses import dataclass
+import argparse
+import os
 
 import torch
 from torchvision import datasets, transforms
@@ -188,6 +190,36 @@ class ZeroSplitVerifier(RNN):
                 
             return yL, yU
         
+    def compute_hidden_state_up_to(self, X, split_timestep):
+        """計算到指定timestep的隱藏狀態"""
+        with torch.no_grad():
+            N = X.shape[0]
+            s = self.W_ax.shape[0]  # hidden size
+            
+            if self.a_0 is None:
+                h = torch.zeros(N, s, device=X.device)
+            else:
+                if hasattr(self.a_0, 'clone'):
+                    h = self.a_0.clone().detach()
+                else:
+                    h = self.a_0.copy() if hasattr(self.a_0, 'copy') else self.a_0
+                    
+                if h.dim() == 1:
+                    h = h.unsqueeze(0).expand(N, -1)
+                elif h.shape[0] != N:
+                    h = h.expand(N, -1)
+                
+            # Forward to split timestep
+            for t in range(split_timestep):
+                input_part = torch.matmul(self.W_ax, X[:, t, :].unsqueeze(2)).squeeze(2)  # [N, s]
+                hidden_part = torch.matmul(self.W_aa, h.unsqueeze(2)).squeeze(2)  # [N, s]
+                pre_h = input_part + hidden_part + self.b_ax + self.b_aa
+                
+                # Apply activation function
+                h = self.activation_function(pre_h)
+                
+            return h
+        
     def adjust_eps_input_for_split(self, original_eps, X, v, sub_l, sub_u, cross_zero_mask, is_pos=True):
         """
         對切分的該層與維度的input調整至中心位置，epsilon即為以新input為中心的擾動範圍
@@ -198,12 +230,33 @@ class ZeroSplitVerifier(RNN):
 
         if not cross_zero_mask.any():
             return X, original_eps
+        
+        if timestep > 0:
+            h_prev = self.compute_hidden_state_up_to(self.original_X, timestep)
+        else:
+            # For first timestep, use initial hidden state
+            N = X.shape[0]
+            s = self.W_ax.shape[0]  # hidden size
+            if self.a_0 is None:
+                h_prev = torch.zeros(N, s, device=X.device)
+            else:
+                if hasattr(self.a_0, 'clone'):
+                    h_prev = self.a_0.clone().detach()
+                else:
+                    h_prev = self.a_0.copy() if hasattr(self.a_0, 'copy') else self.a_0
+                    
+                # 確保h_prev的形狀正確
+                if h_prev.dim() == 1:
+                    h_prev = h_prev.unsqueeze(0).expand(N, -1)  # [N, s]
+                elif h_prev.shape[0] != N:
+                    h_prev = h_prev.expand(N, -1)
 
         W_ax = self.W_ax # Input weights matrix [hidden size, input_size]
+        W_aa = self.W_aa # Hidden weights matrix [hidden size, hidden_size]
         new_eps_values = []
         
         # Iterate each batch
-        batch_size = X.shape[0]
+        batch_size = new_X.shape[0]
         hidden_size = cross_zero_mask.shape[1]
 
         for batch_idx in range(batch_size):
@@ -212,6 +265,14 @@ class ZeroSplitVerifier(RNN):
                     # Retrieve the lower and upper bounds for the splitted neuron
                     l_val = sub_l[batch_idx, neuron_idx].item()
                     u_val = sub_u[batch_idx, neuron_idx].item()
+
+                    # 扣除累積影響
+                    hidden_contribution = W_aa[neuron_idx, :] @ h_prev[batch_idx, :]
+                    accumulated_effect = (hidden_contribution + self.b_aa[neuron_idx]).item()
+
+                    # 純輸入影響的範圍：扣除累積影響
+                    pure_input_l = l_val - accumulated_effect
+                    pure_input_u = u_val - accumulated_effect
 
                     # Choose the midpoint based on the positive region or negative region
                     target_mid = u_val / 2.0 if is_pos else l_val / 2.0
@@ -222,14 +283,10 @@ class ZeroSplitVerifier(RNN):
                     weight_to_neuron = W_ax[neuron_idx, :] # Weight on that neuron [input_size]
                     max_weight_idx = torch.argmax(torch.abs(weight_to_neuron)) # The index of the input with the largest weight
 
-                    # y_pre = W_ax[neuron_idx, :] @ x + b_total
-                    # Note: RNN bias is split into two parts: b_ax and b_aa
-                    total_bias = self.b_ax[neuron_idx] + self.b_aa[neuron_idx]
-
                     # Inverse Solution - Calculate the required input adjustments
                     # Mathematical: To be solved: W_ax[neuron_idx, max_idx] * delta_x = delta_y
                     # delta_y = target_mid - current_pre_act
-                    current_pre_act = (weight_to_neuron @ X[batch_idx, timestep, :] + total_bias)
+                    current_pre_act = (weight_to_neuron @ X[batch_idx, timestep, :] + self.b_ax[neuron_idx])
                     needed_change = target_mid - current_pre_act
 
                     if weight_to_neuron[max_weight_idx] != 0:
@@ -242,9 +299,9 @@ class ZeroSplitVerifier(RNN):
                         weight_abs = torch.abs(weight_to_neuron[max_weight_idx]).item()
                         if is_pos:
                             # Perturbation in input: pre-activation change / (absolute weight)
-                            eps_needed = (u_val - target_mid) / weight_abs
+                            eps_needed = abs((pure_input_u - target_mid) / weight_abs)
                         else:
-                            eps_needed = (target_mid - l_val) / weight_abs
+                            eps_needed = abs((target_mid - pure_input_l) / weight_abs)
                         new_eps_values.append(eps_needed)
 
                     
@@ -252,11 +309,6 @@ class ZeroSplitVerifier(RNN):
         # Conservatism - choose the smallest epsilon
         # Make sure all adjusted inputs are within bounds
         new_eps = min(new_eps_values) if new_eps_values else original_eps
-        # 計算新的epsilon (簡單情況)
-        # if is_pos:
-        #     new_eps = (torch.max(sub_u[cross_zero_mask]) / 2.0).item()
-        # else:
-        #     new_eps = (torch.max(torch.abs(sub_l[cross_zero_mask])) / 2.0).item()
 
         return new_X, new_eps
             
@@ -726,60 +778,26 @@ class ZeroSplitVerifier(RNN):
             
             return is_verified, unsafe_layer, top1_class
             
-    
-    
-def main():
-    """示例使用"""
-    # 設置參數 (MNIST)
-    # input_size = int(28 * 28 / 2)  # MNIST分成2個time steps
-    # hidden_size = 2
-    # output_size = 10
-    # time_step = 2
-    # batch_size = 10
-    # eps = 0.5
-    # activation = 'relu'
-    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Toy RNN
-    input_size = 1
-    hidden_size = 1
-    output_size = 2
-    time_step = 2
-    batch_size = 1
-    eps = 1.5
-    activation = 'relu'
-    device = torch.device('cpu')
-    
-    print("=== Toy RNN ===")
-
-    # 創建模型
-    verifier = ZeroSplitVerifier(input_size, hidden_size, output_size, time_step, activation, max_splits=1, debug=False)
-    # verifier.load_state_dict(torch.load("C:/Users/leolin9/POPQORN/models/mnist_classifier/rnn_1_2_relu/rnn", map_location='cpu'))
-    # verifier.to(device)
-    
-    # 手動設定toy RNN的權重
+def create_toy_rnn(verifier):
     with torch.no_grad():
-        # 設定權重
-        verifier.rnn = None # 不使用原始RNN
+        verifier.rnn = None
         
-        # 輸入到隱藏層的權重
+        verifier.a_0 = torch.tensor([0.25], dtype=torch.float32)
+        
         verifier.W_ax = torch.tensor([
-            [1.0] # 第一個time step
+            [1.0],
         ], dtype=torch.float32)
         
-        # 隱藏層到隱藏層的權重
         verifier.W_aa = torch.tensor([
-            [0.0]
+            [-3.0]
         ], dtype=torch.float32)
         
-        # 隱藏層到輸出層的權重
         verifier.W_fa = torch.tensor([
             [1.0]
         ], dtype=torch.float32)
         
-        # Bias
         verifier.b_ax = torch.tensor([0.0], dtype=torch.float32)
-        verifier.b_aa = torch.tensor([0.0], dtype=torch.float32) # 要多個hidden size跨越0調整這裡
+        verifier.b_aa = torch.tensor([0.0], dtype=torch.float32)
         verifier.b_f = torch.tensor([0.0], dtype=torch.float32)
         
         def forward(self, X):
@@ -787,58 +805,119 @@ def main():
                 N = X.shape[0]
                 h = torch.zeros(N, self.time_step+1, self.num_neurons, device=X.device)
                 
-                # 第一個時間步
                 pre_h = torch.matmul(X[:,0,:], self.W_ax.t()) + self.b_ax
                 h[:,1,:] = torch.relu(pre_h)
-
-                # 第二個時間步
-                pre_h = torch.matmul(h[:,1,:], self.W_aa.t()) + self.b_aa
+                
+                pre_h = torch.matmul(X[:,1,:], self.W_ax.t()) + self.b_ax + torch.matmul(h[:,1,:], self.W_aa.t())
                 h[:,2,:] = torch.relu(pre_h)
                 
-                # 輸出層
                 output = torch.matmul(h[:,2,:], self.W_fa.t()) + self.b_f
                 return output
         
-        # 替換原本的forward方法
         verifier.forward = types.MethodType(forward, verifier)
+
+    
+def main():
+
+    parser = argparse.ArgumentParser(description='ZeroSplit Verifier for RNN robustness verification')
+
+    parser.add_argument('--hidden-size', default=2, type=int, metavar='HS',
+                        help='hidden layer size (default: 2)')
+    parser.add_argument('--time-step', default=2, type=int, metavar='TS',
+                        help='number of time steps (default: 2)')
+    parser.add_argument('--activation', default='relu', type=str, metavar='A',
+                        help='activation function: tanh or relu (default: relu)')
+    parser.add_argument('--work-dir', default='../models/mnist_classifier/rnn_1_2_relu/', type=str, metavar='WD',
+                        help='directory with pretrained model')
+    parser.add_argument('--model-name', default='rnn', type=str, metavar='MN',
+                        help='pretrained model name (default: rnn)')
+    
+    parser.add_argument('--cuda', action='store_true',
+                        help='use GPU')
+    parser.add_argument('--cuda-idx', default=0, type=int, metavar='CI',
+                        help='GPU index (default: 0)')
+
+    parser.add_argument('--N', default=5, type=int,
+                        help='number of samples (default: 5)')
+    parser.add_argument('--p', default=2, type=int,
+                        help='p norm (default: 2)')
+    parser.add_argument('--eps', default=0.5, type=float,
+                        help='perturbation epsilon (default: 0.5)')
+    parser.add_argument('--max-splits', default=1, type=int,
+                        help='maximum splits (default: 1)')
+    parser.add_argument('--merge-results', action='store_true',
+                        help='merge split results')
+    parser.add_argument('--debug', action='store_true',
+                        help='enable debug output')
+    parser.add_argument('--toy-rnn', action='store_true',
+                        help='use toy RNN instead of MNIST model')
+    
+    args = parser.parse_args()
+
+    if torch.cuda.is_available() and args.cuda:
+        device = torch.device(f'cuda:{args.cuda_idx}')
+    else:
+        device = torch.device('cpu')
+
+    N = args.N
+    p = args.p
+    if p > 100:
+        p = float('inf')
+    eps = args.eps
+    
+    if args.toy_rnn:
+        print("=== Toy RNN ===")
+        input_size = 1
+        hidden_size = 1
+        output_size = 2
+        time_step = 2
+
+        verifier = ZeroSplitVerifier(input_size, hidden_size, output_size, time_step, 
+                                   args.activation, max_splits=args.max_splits, debug=args.debug)
         
-    # X = torch.tensor([
-    # [[0.1, 0.1], [-0.25, 0.3]]  # [batch_size=1, time_steps=2, features=2]
-    # ], dtype=torch.float32).to(device)
-    X = torch.tensor([
-    [[1.0], [1.0]]  # [batch_size=1, time_steps=1, features=2]
-    ], dtype=torch.float32).to(device)
+        create_toy_rnn(verifier)
+
+        X = torch.tensor([
+            [[1], [1]]
+        ], dtype=torch.float32).to(device)
+
+    else:
+        input_size = int(28*28 / args.time_step)
+        hidden_size = args.hidden_size
+        output_size = 10
+        time_step = args.time_step
+        
+        verifier = ZeroSplitVerifier(input_size, hidden_size, output_size, time_step, 
+                                   args.activation, max_splits=args.max_splits, debug=args.debug)
+        
+        model_file = os.path.join(args.work_dir, args.model_name)
+        verifier.load_state_dict(torch.load(model_file, map_location='cpu'))
+        verifier.to(device)
+        
+        X, y, target_label = sample_mnist_data(
+            N=N, seq_len=time_step, device=device,
+            data_dir='../data/mnist', train=False, shuffle=True, rnn=verifier
+        )
+        print(f"Sampled {N} data points with shape: {X.shape}")
+        print(f"X: {X}")
+        
+        verifier.extractWeight(clear_original_model=False)
+
+    print(f"\n=== Zero Split Verification (merge_results={args.merge_results}) ===")
+    is_verified, unsafe_layer, top1_class = verifier.verify_network(
+        X, eps, merge_results=args.merge_results
+    )
     
-    print("輸入數據 X 形狀:", X.shape)
-    print("輸入數據 X:", X)
-    
-    # with torch.no_grad():
-    #     output = verifier(X)
-    #     print("\n手動計算的輸出:", output)
-    #     top1_class = output.argmax(dim=1)
-    #     print("預測類別:", top1_class)
-    
-    print("\n=== 計算沒有分割的bounds ===")
-    # verifier.clear_intermediate_variables()
-    
-    # yL_hid, yU_hid = verifier.computePreactivationBounds(eps, p=2, X=X, Eps_idx=torch.arange(1, time_step+1))
-    
-    # # 計算第一個timestep的bounds
-    # print("\n第一個timestep的bounds:")
-    # print("第一Timestep的Lower bound:", verifier.l[1])
-    # print("第一Timestep的Upper bound:", verifier.u[1])
-    
-    # # 計算第二個timestep的bounds
-    # print("\n第二個timestep的bounds:")
-    # print("第二Timestep的Lower bound:", verifier.l[2])
-    # print("第二Timestep的Upper bound:", verifier.u[2])
-    
-    # # 計算最終輸出的bounds
-    # print("\n計算最終輸出bounds:")
-    # yL_out, yU_out = verifier.computeLast2sideBound(eps, p=2, v=time_step+1, X=X, Eps_idx=torch.arange(1, time_step+1))
-    # print("輸出的Lower bound:", yL_out)
-    # print("輸出的Upper bound:", yU_out)
-    # print("輸出bounds差異:", yU_out - yL_out)
+    print(f"\n=== Results ===")
+    print(f"Predicted class: {top1_class}")
+    if is_verified:
+        print(f"Verification successful!")
+        print(f"Split count: {verifier.split_count}")
+    else:
+        print(f"Verification failed")
+        if unsafe_layer:
+            print(f"Unsafe layer: {unsafe_layer}")
+    # verifier.load_state_dict(torch.load("C:/Users/leolin9/POPQORN/models/mnist_classifier/rnn_1_2_relu/rnn", map_location='cpu'))
         
     # 抽樣data
     # X, y, target_label = sample_mnist_data(
@@ -856,41 +935,6 @@ def main():
 
     # 提取權重用於bound計算
     # verifier.extractWeight(clear_original_model=False)
-    
-    
-    ## 1. 分開驗證兩個子問題 (任一子問題驗證成功即整體成功)
-    print("\n=== 分開驗證子問題模式 ===")
-    is_verified, unsafe_layer, top1_class = verifier.verify_network(X, eps, merge_results=True)
-    
-    print("\n=== 驗證結果 ===")
-    print(f"原始預測類別: {top1_class}")
-    if is_verified:
-        print(f"經過split後驗證成功!")
-        print(f"使用的split次數: {verifier.split_count}")
-    else:
-        print(f"驗證失敗")
-        print(f"問題層: {unsafe_layer}")
-        
-    
-    # 原本單純去計算bounds(已確認成功)
-    # yL, yU = verifier.computePreactivationBounds(eps, p=2, v=1, X=X, Eps_idx=torch.arange(1, time_step+1))
-    
-    # # for k in range(1, time_step+1):
-    # #     yU, yL = verifier.compute2sideBound(eps, p=2, v=k, X=X[:, 0:k, :], Eps_idx=torch.arange(1, time_step+1))
-    # print(f"Final hidden bounds:")
-    # print(f"Lower hidden bound: {yL}")
-    # print(f"Upper hidden bound: {yU}")
-    
-    # yL, yU = verifier.computeLast2sideBound(eps, p=2, v=time_step+1, X=X, Eps_idx=torch.arange(1, time_step+1))
-    # print(f"Final output bounds:")
-    # print(f"Lower output bound: {yL}")
-    # print(f"Upper output bound: {yU}")
-            
-    #verifier.compute2sideBound(eps, p=2, v=1, X=X, Eps_idx=1)
-
-    # 執行驗證
-    #result = verifier.verify_network(rnn, X, eps, y)
-    #print(f"Verification result: {result}")
 
 if __name__ == "__main__":
     main()
