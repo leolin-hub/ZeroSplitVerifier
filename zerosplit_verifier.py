@@ -28,7 +28,7 @@ class ZeroSplitVerifier(RNN):
         self.split_count = 0
         self.debug = debug
         
-    def _compute_basic_bounds(self, eps, p, v, X, N, s, n, idx_eps):
+    def _compute_basic_bounds(self, eps, p, v, X, N, s, n, idx_eps, return_for_split=False):
         """計算當前timestep input的bounds
         
         Args:
@@ -77,6 +77,10 @@ class ZeroSplitVerifier(RNN):
                 X = X.view(N, 1, n)  # 確保維度正確           
             yU = yU + torch.matmul(W_ax, X[:, v-1, :].view(N, n, 1)).squeeze(2)  # [N, s]
             yL = yL + torch.matmul(W_ax, X[:, v-1, :].view(N, n, 1)).squeeze(2)  # [N, s]
+
+            if return_for_split:
+                input_yL = yL.clone().detach()
+                input_yU = yU.clone().detach()
             
             # 第三項: A^{<v>} (b_a + Delta^{<v>}) and Ou^ {<v>} (b_a + Theta^{<v>})
             yU = yU + b_aa + b_ax  # [N, s]
@@ -87,7 +91,10 @@ class ZeroSplitVerifier(RNN):
                 print(f"Current Timestep {v} input lower: {yL}")
                 print(f"Current Timestep {v} input upper: {yU}")
             
-            return yU, yL
+            if return_for_split:
+                return yU, yL, input_yU, input_yL
+            else:
+                return yU, yL
         
     def computePreactivationBounds(self, eps, p, X = None, Eps_idx = None, unsafe_layer=None, merge_results=True, cross_zero=None):
         """計算hidden layer的preactivation bounds"""
@@ -146,7 +153,12 @@ class ZeroSplitVerifier(RNN):
             b_aa = self.b_aa.unsqueeze(0).expand(N,-1)  # [N, s]
            
             # v-th terms基本計算
-            yU, yL = self._compute_basic_bounds(eps, p, v, X, N, s, n, idx_eps)
+            if unsafe_layer == v and not split_done:
+                yU, yL, input_yU, input_yL = self._compute_basic_bounds(eps, p, v, X, N, s, n, idx_eps, return_for_split=True)
+                self.input_yL = input_yL
+                self.input_yU = input_yU
+            else:
+                yU, yL = self._compute_basic_bounds(eps, p, v, X, N, s, n, idx_eps)
             
             if not (v == 1):
                 self.split_count = 0
@@ -190,131 +202,69 @@ class ZeroSplitVerifier(RNN):
                 
             return yL, yU
         
-    def compute_hidden_state_up_to(self, X, split_timestep):
-        """計算到指定timestep的隱藏狀態"""
-        with torch.no_grad():
-            N = X.shape[0]
-            s = self.W_ax.shape[0]  # hidden size
-            
-            if self.a_0 is None:
-                h = torch.zeros(N, s, device=X.device)
-            else:
-                if hasattr(self.a_0, 'clone'):
-                    h = self.a_0.clone().detach()
-                else:
-                    h = self.a_0.copy() if hasattr(self.a_0, 'copy') else self.a_0
-                    
-                if h.dim() == 1:
-                    h = h.unsqueeze(0).expand(N, -1)
-                elif h.shape[0] != N:
-                    h = h.expand(N, -1)
-                
-            # Forward to split timestep
-            for t in range(split_timestep):
-                input_part = torch.matmul(self.W_ax, X[:, t, :].unsqueeze(2)).squeeze(2)  # [N, s]
-                hidden_part = torch.matmul(self.W_aa, h.unsqueeze(2)).squeeze(2)  # [N, s]
-                pre_h = input_part + hidden_part + self.b_ax + self.b_aa
-                
-                # Apply activation function
-                h = self.activation_function(pre_h)
-                
-            return h
-        
-    def adjust_eps_input_for_split(self, original_eps, X, v, sub_l, sub_u, cross_zero_mask, is_pos=True):
-        """
-        對切分的該層與維度的input調整至中心位置，epsilon即為以新input為中心的擾動範圍
-        """
-        new_X = X.clone().detach()
-
-        timestep = v - 1
-
-        if not cross_zero_mask.any():
-            return X, original_eps
-        
-        if timestep > 0:
-            h_prev = self.compute_hidden_state_up_to(self.original_X, timestep)
-        else:
-            # For first timestep, use initial hidden state
-            N = X.shape[0]
-            s = self.W_ax.shape[0]  # hidden size
-            if self.a_0 is None:
-                h_prev = torch.zeros(N, s, device=X.device)
-            else:
-                if hasattr(self.a_0, 'clone'):
-                    h_prev = self.a_0.clone().detach()
-                else:
-                    h_prev = self.a_0.copy() if hasattr(self.a_0, 'copy') else self.a_0
-                    
-                # 確保h_prev的形狀正確
-                if h_prev.dim() == 1:
-                    h_prev = h_prev.unsqueeze(0).expand(N, -1)  # [N, s]
-                elif h_prev.shape[0] != N:
-                    h_prev = h_prev.expand(N, -1)
-
-        W_ax = self.W_ax # Input weights matrix [hidden size, input_size]
-        W_aa = self.W_aa # Hidden weights matrix [hidden size, hidden_size]
-        new_eps_values = []
+    def adjust_eps_input_for_split(self, cur_v_input_l, cur_v_input_u, original_X, v, cross_zero_mask, p):
         
         # Iterate each batch
-        batch_size = new_X.shape[0]
+        batch_size = original_X.shape[0]
         hidden_size = cross_zero_mask.shape[1]
-
+        
+        if p == 1:
+            q = float('inf')
+        elif p == 'inf' or p == float('inf'):
+            q = 1
+        else:
+            q = p / (p - 1)
+        
+        X_pos = original_X.clone().detach()
+        X_neg = original_X.clone().detach()
+        
+        W_ax = self.W_ax
+        
+        weight_norm_val = torch.norm(W_ax, p=q, dim=1)
+        
+        eps_pos_values = []
+        eps_neg_values = []
+        
         for batch_idx in range(batch_size):
             for neuron_idx in range(hidden_size):
                 if cross_zero_mask[batch_idx, neuron_idx]:
                     # Retrieve the lower and upper bounds for the splitted neuron
-                    l_val = sub_l[batch_idx, neuron_idx].item()
-                    u_val = sub_u[batch_idx, neuron_idx].item()
-
-                    # 扣除累積影響
-                    hidden_contribution = W_aa[neuron_idx, :] @ h_prev[batch_idx, :]
-                    total_bias = self.b_ax[neuron_idx] + self.b_aa[neuron_idx]
-                    accumulated_effect = (hidden_contribution + total_bias).item()
-
-                    # 純輸入影響的範圍：扣除累積影響
-                    pure_input_l = l_val - accumulated_effect
-                    pure_input_u = u_val - accumulated_effect
-
-                    # Choose the midpoint based on the positive region or negative region
-                    if is_pos:
-                        target_mid = pure_input_u / 2.0
-                    else:
-                        target_mid = pure_input_l / 2.0
-
-                    # Weights Analysis - find the neuron with the most significant weight
-                    # Mathematical: (dy)/(dx_i) = W_ax[neuron_idx, i]
-                    # Choose the biggest influence made neuron in |W_ax[neuron_idx, :]|, since small change can cause large change in pre-activation
-                    weight_to_neuron = W_ax[neuron_idx, :] # Weight on that neuron [input_size]
-                    max_weight_idx = torch.argmax(torch.abs(weight_to_neuron)) # The index of the input with the largest weight
-
-                    # Inverse Solution - Calculate the required input adjustments
-                    # Mathematical: To be solved: W_ax[neuron_idx, max_idx] * delta_x = delta_y
-                    # delta_y = target_mid - current_pre_act
-                    current_pre_act = (weight_to_neuron @ X[batch_idx, timestep, :] + self.b_ax[neuron_idx])
-                    needed_change = target_mid - current_pre_act
-
-                    if weight_to_neuron[max_weight_idx] != 0:
-                        # Linear inverse solution: Delta_x = delta_y / W[max_weight_idx]
-                        input_change = needed_change / weight_to_neuron[max_weight_idx].item()
-                        new_X[batch_idx, timestep, max_weight_idx] += input_change
-
-                        # 對此neuron計算epsilon
-                        # Need to cover the distance from the midpoint to the bounds
-                        weight_abs = torch.abs(weight_to_neuron[max_weight_idx]).item()
-                        if is_pos:
-                            # Perturbation in input: pre-activation change / (absolute weight)
-                            eps_needed = abs((pure_input_u - target_mid) / weight_abs)
-                        else:
-                            eps_needed = abs((target_mid - pure_input_l) / weight_abs)
-                        new_eps_values.append(eps_needed)
-
+                    input_l = cur_v_input_l[batch_idx, neuron_idx].item()
+                    input_u = cur_v_input_u[batch_idx, neuron_idx].item()
                     
-        # 取最保守epsilon
-        # Conservatism - choose the smallest epsilon
-        # Make sure all adjusted inputs are within bounds
-        new_eps = min(new_eps_values) if new_eps_values else original_eps
-
-        return new_X, new_eps
+                    neuron_norm = weight_norm_val[neuron_idx].item()
+                    
+                    weight_to_neuron = W_ax[neuron_idx, :]
+                    max_weight_idx = torch.argmax(torch.abs(weight_to_neuron))
+                    
+                    # 負區間 - 調整input至中心位置
+                    neg_range_center = input_l / 2.0
+                    new_neg_input = neg_range_center / neuron_norm
+                    
+                    # 更新負區間的輸入
+                    X_neg[batch_idx, v-1, max_weight_idx] = new_neg_input
+                    
+                    # 負區間 - 計算epsilon： 中點去掉2-norm後與原點的距離
+                    neg_range_half_width = abs(neg_range_center)  # |input_l - neg_range_center|
+                    eps_neg = neg_range_half_width / neuron_norm
+                    eps_neg_values.append(eps_neg)
+                    
+                    # 正區間 - 調整input至中心位置
+                    pos_range_center = input_u / 2.0
+                    new_pos_input = pos_range_center / neuron_norm
+                    
+                    # 更新正區間的輸入
+                    X_pos[batch_idx, v-1, max_weight_idx] = new_pos_input
+                    
+                    # 正區間 - 計算epsilon： 中點去掉2-norm後與原點的距離
+                    pos_range_half_width = pos_range_center  # |input_u - pos_range_center|
+                    eps_pos = pos_range_half_width / neuron_norm
+                    eps_pos_values.append(eps_pos)
+                    
+        eps_pos = min(eps_pos_values) if eps_pos_values else 0.0
+        eps_neg = min(eps_neg_values) if eps_neg_values else 0.0
+            
+        return X_pos, X_neg, eps_pos, eps_neg
             
     def _split_and_compute_separate(self, eps, p, v, X, Eps_idx, cross_zero=None):
         """分割當前層並分別計算兩個子問題"""
@@ -322,6 +272,9 @@ class ZeroSplitVerifier(RNN):
         orig_l = self.l[v].clone().detach()
         orig_u = self.u[v].clone().detach()
         full_X = self.original_X.clone().detach()
+
+        cur_v_input_l = self.input_yL
+        cur_v_input_u = self.input_yU
         
         if self.debug:
             print(f"Splitting layer {v}, cross_zero count: {cross_zero.sum().item()}")
@@ -331,13 +284,12 @@ class ZeroSplitVerifier(RNN):
         neg_yL, neg_yU = None, None
         
         # 正區間: x >= 0
-        is_pos = True
         pos_l = orig_l.clone().detach()
         pos_u = orig_u.clone().detach()
         pos_l[cross_zero] = 0
-
-        # 實驗性：計算調整後的 epsilon for positive sub-problem
-        X_pos, eps_pos = self.adjust_eps_input_for_split(eps, full_X, v, pos_l, pos_u, cross_zero)
+        
+        # 得到正負區間新的input和epsilon
+        X_pos, X_neg, eps_pos, eps_neg = self.adjust_eps_input_for_split(cur_v_input_l, cur_v_input_u, full_X, v, cross_zero, p)
         
         self.l[v] = pos_l
         self.u[v] = pos_u
@@ -369,8 +321,6 @@ class ZeroSplitVerifier(RNN):
         neg_l = orig_l.clone().detach()
         neg_u = orig_u.clone().detach()
         neg_u[cross_zero] = 0
-        
-        X_neg, eps_neg = self.adjust_eps_input_for_split(eps, full_X, v, neg_l, neg_u, cross_zero, is_pos=False)
         
         self.l[v] = neg_l
         self.u[v] = neg_u
@@ -786,14 +736,14 @@ def create_toy_rnn(verifier):
     with torch.no_grad():
         verifier.rnn = None
         
-        verifier.a_0 = torch.tensor([0.25], dtype=torch.float32)
+        verifier.a_0 = torch.tensor([0.0], dtype=torch.float32)
         
         verifier.W_ax = torch.tensor([
-            [1.0],
+            [2.0],
         ], dtype=torch.float32)
         
         verifier.W_aa = torch.tensor([
-            [-3.0]
+            [1.0]
         ], dtype=torch.float32)
         
         verifier.W_fa = torch.tensor([
@@ -841,7 +791,7 @@ def main():
     parser.add_argument('--cuda-idx', default=0, type=int, metavar='CI',
                         help='GPU index (default: 0)')
 
-    parser.add_argument('--N', default=5, type=int,
+    parser.add_argument('--N', default=100, type=int,
                         help='number of samples (default: 5)')
     parser.add_argument('--p', default=2, type=int,
                         help='p norm (default: 2)')
