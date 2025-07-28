@@ -67,11 +67,11 @@ if __name__ == '__main__':
     params = {
         'hidden_size': 2,
         'output_size': 10,
-        'time_step': 2,
+        'time_step': 7,
         'p': 2,
         'batch_size': 10,
         'eps': 0.5,
         'activation': 'relu',
-        'model_path': 'C:/Users/LiLe556/Leo file/models/mnist_classifier/rnn_2_2_relu/rnn'
+        'model_path': './models/mnist_classifier/rnn_7_2_relu/rnn'
     }
     test_bounds_consistency(**params)

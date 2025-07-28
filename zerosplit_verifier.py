@@ -589,15 +589,15 @@ class ZeroSplitVerifier(RNN):
         # 3. 檢查robustness
         N = X.shape[0]
         robust = True
-        top1_class = 1
-        # for i in range(N):
-        #     top1 = top1_class[i]
-        #     other_classes = [j for j in range(self.output_size) if j != top1]
+        # top1_class = [1]
+        for i in range(N):
+            top1 = top1_class[i]
+            other_classes = [j for j in range(self.output_size) if j != top1]
             
-        #     # 檢查top1 class的lower bound是否大於其他所有class的upper bound
-        #     if not all(yL_out[i,top1] > yU_out[i,j] for j in other_classes):
-        #         robust = False
-        #         return False, top1_class
+            # 檢查top1 class的lower bound是否大於其他所有class的upper bound
+            if not all(yL_out[i,top1] > yU_out[i,j] for j in other_classes):
+                robust = False
+                return False, top1_class
                 
         return robust, top1_class
     
@@ -731,7 +731,105 @@ class ZeroSplitVerifier(RNN):
             print(f"整體驗證結果: {is_verified}")
             
             return is_verified, unsafe_layer, top1_class
+        
+    
+    #我寫的部分
+    def verify_network_recursive(self, X, eps, max_splits=3, merge_results=False):
+        self.original_X = X.clone().detach()
+        
+        #初始驗證
+        is_verified, top1_class = self.verify_robustness(X, eps)
+        if is_verified:
+            if self.debug:
+                print("初始驗證成功，無需split")
+            return True, None, top1_class
+    
+        #初始驗證失敗的情況
+        if self.debug:
+            print("初始驗證失敗，開始遞迴split")
             
+        is_verified = self._recursive_split_verify(X, eps, top1_class, split_count=0, max_splits=max_splits)
+        
+        return is_verified, None, top1_class
+
+        
+    def _recursive_split_verify(self, X, eps, top1_class, split_count, max_splits):
+        if self.debug:
+            print(f"進入遞迴第{split_count}層")
+        
+        #終止條件判斷
+        if split_count >= max_splits:
+            if self.debug:
+                print(f"達到最大 split 數{max_splits}次，驗證失敗")
+            return False
+
+        #初次驗證
+        is_verified, _ = self.verify_robustness(X, eps)
+        if is_verified:
+            if self.debug:
+                print(f"第{split_count}層驗證成功")
+            return True
+
+        #找出Unsafe Layer
+        unsafe_layer, cross_zero = self.locate_unsafe_layer()
+        if unsafe_layer is None:
+            if self.debug:
+                print("找不到 unsafe layer，驗證終止")
+            return False
+        
+        print(f"Found unsafe layer: {unsafe_layer} with {cross_zero.sum()} dims crossing zero")
+        
+        #Propagate
+        for k in range(1, unsafe_layer):
+            self.compute2sideBound(
+                eps, p=2, v=k, X=X[:, 0:k, :],
+                Eps_idx=torch.arange(1, self.time_step + 1)
+            )
+            
+        # 對unsafe layer split為正負兩區
+        (pos_bounds, neg_bounds) = self.compute2sideBound(
+            eps, p=2, v=unsafe_layer, X=X[:, 0:unsafe_layer, :],
+            Eps_idx=torch.arange(1, self.time_step + 1),
+            unsafe_layer=unsafe_layer, merge_results=False, cross_zero=cross_zero
+        )
+        
+        (pos_yL_out, pos_yU_out) = pos_bounds
+        (neg_yL_out, neg_yU_out) = neg_bounds
+        N = X.shape[0]
+        pos_verified = True
+        neg_verified = True
+        
+        for i in range(N):
+            top1 = top1_class[i]
+            other_classes = [j for j in range(self.output_size) if j != top1]
+            
+            #正區間
+            if not all(pos_yL_out[i, top1] > pos_yU_out[i, j] for j in other_classes):
+                if self.debug:
+                    print(f"正區間驗證失敗，繼續split")
+                pos_verified = self._recursive_split_verify(
+                    X, eps, top1_class, split_count + 1, max_splits
+                )
+                break
+            
+        for i in range(N):
+            top1 = top1_class[i]
+            other_classes = [j for j in range(self.output_size) if j != top1]
+            
+            #負區間
+            if not all(neg_yL_out[i, top1] > neg_yU_out[i, j] for j in other_classes):
+                if self.debug:
+                    print(f"負區間驗證失敗，繼續 split")
+                neg_verified = self._recursive_split_verify(
+                    X, eps, top1_class, split_count + 1, max_splits
+                )
+                break
+            
+        success = pos_verified and neg_verified
+        if self.debug:
+            print(f"第{split_count}層驗證結果: {"成功" if success else "失敗"}")
+        return success
+             
 def create_toy_rnn(verifier):
     with torch.no_grad():
         verifier.rnn = None
@@ -777,11 +875,11 @@ def main():
 
     parser.add_argument('--hidden-size', default=2, type=int, metavar='HS',
                         help='hidden layer size (default: 2)')
-    parser.add_argument('--time-step', default=2, type=int, metavar='TS',
+    parser.add_argument('--time-step', default=7, type=int, metavar='TS',
                         help='number of time steps (default: 2)')
     parser.add_argument('--activation', default='relu', type=str, metavar='A',
                         help='activation function: tanh or relu (default: relu)')
-    parser.add_argument('--work-dir', default='../models/mnist_classifier/rnn_1_2_relu/', type=str, metavar='WD',
+    parser.add_argument('--work-dir', default='./models/mnist_classifier/rnn_7_2_relu/', type=str, metavar='WD',
                         help='directory with pretrained model')
     parser.add_argument('--model-name', default='rnn', type=str, metavar='MN',
                         help='pretrained model name (default: rnn)')
@@ -797,7 +895,7 @@ def main():
                         help='p norm (default: 2)')
     parser.add_argument('--eps', default=0.5, type=float,
                         help='perturbation epsilon (default: 0.5)')
-    parser.add_argument('--max-splits', default=1, type=int,
+    parser.add_argument('--max-splits', default=3, type=int,
                         help='maximum splits (default: 1)')
     parser.add_argument('--merge-results', action='store_true',
                         help='merge split results')
@@ -858,7 +956,7 @@ def main():
         verifier.extractWeight(clear_original_model=False)
 
     print(f"\n=== Zero Split Verification (merge_results={args.merge_results}) ===")
-    is_verified, unsafe_layer, top1_class = verifier.verify_network(
+    is_verified, unsafe_layer, top1_class = verifier.verify_network_recursive(
         X, eps, merge_results=args.merge_results
     )
     
