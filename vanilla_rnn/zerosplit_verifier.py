@@ -4,6 +4,12 @@ from bound_vanilla_rnn import RNN
 import torch.nn as nn
 import argparse
 import os
+from loguru import logger
+import json
+import sys
+from datetime import datetime
+import io
+from contextlib import redirect_stdout, redirect_stderr
 
 import torch
 from torchvision import datasets, transforms
@@ -11,12 +17,218 @@ from utils.sample_data import sample_mnist_data
 from utils.sample_stock_data import prepare_stock_tensors_split
 import get_bound_for_general_activation_function as get_bound
 
+class LoggerCapture:
+    """捕獲logger輸出的類"""
+    def __init__(self):
+        self.captured_logs = []
+        
+    def capture_handler(self, message):
+        """loguru handler來捕獲log訊息"""
+        # 簡化版本：只保存message內容和時間戳
+        self.captured_logs.append({
+            'timestamp': datetime.now().isoformat(),
+            'message': str(message).strip()
+        })
+
+def setup_result_logging(work_dir, eps_value, args):
+    """設置結果保存的資料夾結構和logger捕獲"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 建立時間子資料夾 - 在當前目錄(vanilla_rnn)下建立verification_results
+    current_dir = os.path.dirname(os.path.abspath(__file__))  # vanilla_rnn目錄
+    session_dir = os.path.join(current_dir, "verification_results", f"session_{timestamp}")
+    os.makedirs(session_dir, exist_ok=True)
+    
+    # 建立本次實驗的檔案名稱
+    base_name = f"zerosplit_eps{eps_value}_N{args.N}_maxsplit{args.max_splits}"
+    json_file = os.path.join(session_dir, f"{base_name}.json")
+    txt_file = os.path.join(session_dir, f"{base_name}.txt")
+    
+    # 設置logger捕獲
+    log_capture = LoggerCapture()
+    
+    # 添加捕獲handler到logger
+    logger.add(log_capture.capture_handler, level="INFO", format="{message}")
+    
+    return json_file, txt_file, log_capture, session_dir
+
+def extract_bounds_analysis_info(captured_logs):
+    """從捕獲的logs中提取bounds analysis資訊"""
+    bounds_analyses = []
+    final_report = {}
+    
+    current_analysis = None
+    in_final_report = False
+    
+    for log_entry in captured_logs:
+        message = log_entry['message']
+        
+        # 檢測bounds analysis開始
+        if "Bounds Analysis" in message and "---" in message:
+            if current_analysis:
+                bounds_analyses.append(current_analysis)
+            
+            stage_name = message.split("---")[1].strip().split(" ")[0]  # 提取stage名稱
+            current_analysis = {
+                'stage': stage_name,
+                'timestamp': log_entry['timestamp'],
+                'metrics': {}
+            }
+            
+        # 檢測final report開始
+        elif "FINAL BOUNDS IMPROVEMENT REPORT" in message:
+            in_final_report = True
+            final_report['start_timestamp'] = log_entry['timestamp']
+            final_report['content'] = []
+            
+        # 收集當前analysis的指標
+        elif current_analysis and any(keyword in message for keyword in [
+            "Samples with bound improvement:",
+            "Average bounds improvement:",
+            "Potential false positive samples:",
+            "Original safe samples:",
+            "Unsafe samples before split:",
+            "Safe samples after split:",
+            "Unsafe samples to safe after split:",
+            "Current stage verification rate:"
+        ]):
+            # 解析指標
+            for keyword in ["Samples with bound improvement:", "Average bounds improvement:", 
+                          "Potential false positive samples:", "Original safe samples:",
+                          "Unsafe samples before split:", "Safe samples after split:",
+                          "Unsafe samples to safe after split:", "Current stage verification rate:"]:
+                if keyword in message:
+                    value = message.split(keyword)[1].strip()
+                    metric_key = keyword.replace(":", "").replace(" ", "_").lower()
+                    current_analysis['metrics'][metric_key] = value
+                    break
+        
+        # 收集final report內容 - 擴展關鍵字匹配
+        elif in_final_report and any(keyword in message for keyword in [
+            "指標", "Gap Reduction", "Improvement Sources", "Status Change", 
+            "├─", "│", "└─", "總體效能評估", "⚠️", "RISK ASSESSMENT",
+            "Samples with", "Average", "Maximum", "contribution", "effectiveness",
+            "Safe samples", "Unsafe samples", "conversions", "success rate",
+            "Overall", "enhancement", "suppression", "reduction"
+        ]):
+            final_report['content'].append({
+                'timestamp': log_entry['timestamp'],
+                'message': message
+            })
+    
+    # 添加最後一個analysis
+    if current_analysis:
+        bounds_analyses.append(current_analysis)
+    
+    return bounds_analyses, final_report
+
+def save_verification_results(json_file, txt_file, captured_logs, args, results_data, session_dir):
+    """保存驗證結果，重點保存logger分析資訊"""
+    
+    # 提取bounds analysis和final report資訊
+    bounds_analyses, final_report = extract_bounds_analysis_info(captured_logs)
+    
+    # 準備保存的數據
+    save_data = {
+        'experiment_info': {
+            'timestamp': datetime.now().isoformat(),
+            'session_dir': session_dir,
+            'model_path': args.work_dir,
+            'model_name': args.model_name,
+            'hidden_size': args.hidden_size,
+            'time_step': args.time_step,
+            'activation': args.activation,
+            'eps': args.eps,
+            'p_norm': args.p,
+            'N_samples': args.N,
+            'max_splits': args.max_splits
+        },
+        'verification_results': results_data,
+        'bounds_analysis': bounds_analyses,
+        'final_report': final_report,
+        'all_logs': [log for log in captured_logs]  # 保留完整log以備查
+    }
+    
+    # 保存JSON
+    with open(json_file, 'w', encoding='utf-8') as f:
+        json.dump(save_data, f, indent=2, ensure_ascii=False)
+    
+    # 保存TXT摘要 - 重點整理bounds analysis
+    with open(txt_file, 'w', encoding='utf-8') as f:
+        f.write(f"ZeroSplit Verification Analysis Report\n")
+        f.write(f"{'='*80}\n")
+        f.write(f"Session: {os.path.basename(session_dir)}\n")
+        f.write(f"Timestamp: {save_data['experiment_info']['timestamp']}\n")
+        f.write(f"Model: {args.work_dir}\n")
+        f.write(f"Parameters: hidden_size={args.hidden_size}, time_step={args.time_step}, activation={args.activation}\n")
+        f.write(f"Test config: eps={args.eps}, p={args.p}, N={args.N}, max_splits={args.max_splits}\n\n")
+        
+        # 基本驗證結果
+        f.write(f"Basic Verification Results:\n")
+        f.write(f"{'-'*40}\n")
+        f.write(f"Final verification: {'SUCCESS' if results_data['is_verified'] else 'FAILED'}\n")
+        f.write(f"Total split count: {results_data['split_count']}\n")
+        f.write(f"Predicted class: {results_data['top1_class']}\n")
+        if not results_data['is_verified'] and results_data['unsafe_layer']:
+            f.write(f"Unsafe layer: {results_data['unsafe_layer']}\n")
+        f.write(f"\n")
+        
+        # Bounds Analysis摘要
+        f.write(f"Bounds Analysis Summary:\n")
+        f.write(f"{'-'*40}\n")
+        for i, analysis in enumerate(bounds_analyses):
+            f.write(f"Stage {i+1} - {analysis['stage']}:\n")
+            for metric, value in analysis['metrics'].items():
+                f.write(f"  {metric.replace('_', ' ').title()}: {value}\n")
+            f.write(f"\n")
+        
+        # Final Report摘要 - 顯示更多詳細指標
+        if final_report and 'content' in final_report:
+            f.write(f"Final Report Detailed Metrics:\n")
+            f.write(f"{'-'*40}\n")
+            
+            # 按指標分組顯示
+            current_metric = None
+            for entry in final_report['content']:
+                message = entry['message']
+                
+                # 檢測指標標題
+                if "指標一" in message or "Gap Reduction" in message:
+                    current_metric = "Gap Reduction"
+                    f.write(f"\n{current_metric}:\n")
+                elif "指標二" in message or "Improvement Sources" in message:
+                    current_metric = "Improvement Sources"  
+                    f.write(f"\n{current_metric}:\n")
+                elif "指標三" in message or "Status Change" in message:
+                    current_metric = "Status Change"
+                    f.write(f"\n{current_metric}:\n")
+                elif "總體效能評估" in message:
+                    current_metric = "Overall Performance"
+                    f.write(f"\n{current_metric}:\n")
+                elif "RISK ASSESSMENT" in message:
+                    current_metric = "Risk Assessment"
+                    f.write(f"\n{current_metric}:\n")
+                
+                # 顯示詳細數據（去掉樹狀符號以便閱讀）
+                if any(symbol in message for symbol in ["├─", "│", "└─"]):
+                    clean_message = message.replace("├─", "").replace("│", "").replace("└─", "").strip()
+                    if clean_message and "===" not in clean_message:
+                        f.write(f"  {clean_message}\n")
+                elif "⚠️" in message or "These samples changed" in message:
+                    f.write(f"  {message}\n")
+
 class ZeroSplitVerifier(RNN):
     def __init__(self, input_size, hidden_size, output_size, time_step, activation, max_splits=1, debug=False):
         RNN.__init__(self, input_size, hidden_size, output_size, time_step, activation) # 1 layer
         self.max_splits = max_splits
         self.split_count = 0
         self.debug = debug
+        # 新增：output bounds tracking
+        self.bound_tracker = {
+            'output_bounds': None,
+            'split_history': [],
+            'current_split_count': 0,
+        }
         
     def _compute_basic_bounds(self, eps, p, v, X, N, s, n, idx_eps, return_for_split=False):
         """計算當前timestep input的bounds
@@ -297,8 +509,8 @@ class ZeroSplitVerifier(RNN):
             pos_yL, pos_yU = self.computeLast2sideBound(
                 eps_pos, p, v=self.time_step+1, X=X_pos, Eps_idx=Eps_idx
             )
-            print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
-            # print(f"正區間的bounds差異: {pos_yU - pos_yL}")
+            # print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
+            print(f"正區間的bounds差異: {pos_yU - pos_yL}")
         else:
             # 確保一直到最後一timestep才切的時候，self.l和self.u有被正確更新
             if pos_l_state is not None:
@@ -314,7 +526,7 @@ class ZeroSplitVerifier(RNN):
             pos_yL, pos_yU = self.computeLast2sideBound(
                 eps_pos, p, v=self.time_step+1, X=X_pos, Eps_idx=Eps_idx
             )
-            print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
+            # print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
             print(f"正區間的bounds差異: {pos_yU - pos_yL}")
         
         # 負區間: x <= 0
@@ -345,8 +557,8 @@ class ZeroSplitVerifier(RNN):
             neg_yL, neg_yU = self.computeLast2sideBound(
                 eps_neg, p, v=self.time_step+1, X=X_neg, Eps_idx=Eps_idx
             )
-            print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
-            # print(f"負區間的bounds差異: {neg_yU - neg_yL}")
+            # print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
+            print(f"負區間的bounds差異: {neg_yU - neg_yL}")
         else:
             # 確保一直到最後一timestep才切的時候，self.l和self.u有被正確更新
             if neg_l_state is not None:
@@ -362,7 +574,7 @@ class ZeroSplitVerifier(RNN):
             neg_yL, neg_yU = self.computeLast2sideBound(
                 eps_neg, p, v=self.time_step+1, X=X_neg, Eps_idx=Eps_idx
             )
-            print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
+            # print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
             print(f"負區間的bounds差異: {neg_yU - neg_yL}")
         
         # 恢復原始bounds
@@ -606,7 +818,6 @@ class ZeroSplitVerifier(RNN):
         # 2. 計算bound
         yL, yU = self.computePreactivationBounds(eps, p=2, X=X, 
                                         Eps_idx=torch.arange(1,self.time_step+1))
-        
         print(f"不做split的隱藏層bounds to verify: {yL}, {yU}")
         
         yL_out, yU_out = self.computeLast2sideBound(eps, p=2, v=self.time_step+1,
@@ -767,16 +978,37 @@ class ZeroSplitVerifier(RNN):
         self.original_X = X.clone().detach()
 
         # 第一次驗證
-        is_verified, top1_class, _, _ = self.verify_robustness(X, eps)
+        logger.info("=== Bounds Tracking Analysis ===")
+        is_verified, top1_class, yL_out, yU_out = self.verify_robustness(X, eps)
+
+        self.bound_tracker['output_bounds'] = {
+            'yL': yL_out,
+            'yU': yU_out,
+            'verified': is_verified
+        }
+
+        self.log_bounds_analysis(yL_out, yU_out, top1_class, "Original")
         if is_verified:
-            print("第一次就驗證成功，無須split")
+            logger.info("第一次就驗證成功，無須split")
             return True, None, top1_class
         
         # 若驗證失敗，找出問題layer並進行split
+        logger.info("第一次驗證失敗，開始split並尋找unsafe layer")
         is_verified = self._recursive_split_verify(X, eps, top1_class, split_count=0, max_splits=max_splits,
                                                     start_timestep=1, refine_preh=None)
         
+        # 輸出最終分析報告
+        self.generate_final_report()
+        
         return is_verified, None, top1_class
+    
+    def _initialize_bounds_tracking(self):
+        """初始化bounds tracking"""
+        self.bound_tracker = {
+            'output_bounds': None,
+            'split_history': [],
+            'current_split_count': 0,
+        }
     
     def _recursive_split_verify(self, X, eps, top1_class, split_count, max_splits, start_timestep=1, refine_preh=None):
         
@@ -784,17 +1016,17 @@ class ZeroSplitVerifier(RNN):
 
         # 終止條件判斷
         if split_count >= max_splits:
-            print(f"達到最大 split 數{max_splits}次，驗證失敗")
+            logger.info(f"達到最大 split 數{max_splits}次，驗證失敗")
             return False
         
         # 每次往後找第一個unsafe layer
         unsafe_layer, cross_zero = self.locate_unsafe_layer(start_timestep, refine_preh)
         if unsafe_layer is None:
-            print("沒有找到unsafe layer")
+            logger.info("沒有找到unsafe layer")
             return True
-        
-        print(f"Found unsafe layer: {unsafe_layer} with {cross_zero.sum()} dims crossing zero")
-        
+
+        logger.info(f"Found unsafe layer: {unsafe_layer} with {cross_zero.sum()} dims crossing zero")
+
         # 在unsafe layer split為正負兩區域 (Input取到unsafe_layer，之後會調整X和eps)
         pos_bounds, neg_bounds, pos_input, neg_input = self.compute2sideBound(
             eps, p=2, v=unsafe_layer, X=X[:, 0:unsafe_layer, :],
@@ -808,48 +1040,337 @@ class ZeroSplitVerifier(RNN):
         (X_pos, eps_pos, pos_bounds_state) = pos_input
         (X_neg, eps_neg, neg_bounds_state) = neg_input
 
+        # 紀錄split完的output bounds
+        self.bound_tracker['current_split_count'] = split_count + 1
+        self.record_split_bounds(pos_yL_out, pos_yU_out, neg_yL_out, neg_yU_out, 
+                                    unsafe_layer, top1_class, "Pos_Neg_split")
+
         # 驗證並遞迴正區間
         pos_verified = self._check_and_recurse(
         pos_yL_out, pos_yU_out, top1_class, X_pos, eps_pos,
-        split_count, max_splits, unsafe_layer + 1, pos_bounds_state
+        split_count, max_splits, unsafe_layer + 1, pos_bounds_state, "Positive"
         )
 
         # 驗證並遞迴負區間
         neg_verified = self._check_and_recurse(
             neg_yL_out, neg_yU_out, top1_class, X_neg, eps_neg,
-            split_count, max_splits, unsafe_layer + 1, neg_bounds_state
+            split_count, max_splits, unsafe_layer + 1, neg_bounds_state, "Negative"
         )   
 
         success = pos_verified and neg_verified
-        print(f"正區間驗證結果: {pos_verified}")
-        print(f"負區間驗證結果: {neg_verified}")
-        print(f"全部切分次數: {split_count}")
+        logger.info(f"Split {split_count + 1} results: Positive={pos_verified}, Negative={neg_verified}")
         return success
     
     def _check_and_recurse(self, yL_out, yU_out, top1_class, X, eps, 
-                      split_count, max_splits, next_timestep, refine_preh):
+                      split_count, max_splits, next_timestep, refine_preh, region_type):
         """檢查驗證結果，如果失敗則遞迴分割"""
         N = yL_out.shape[0]
         
         # 檢查是否有任何樣本驗證失敗
+        failed_samples = []
         for i in range(N):
             top1 = top1_class[i]
             other_classes = [j for j in range(self.output_size) if j != top1]
             
             # 如果當前樣本驗證失敗，需要進一步分割
             if not all(yL_out[i, top1] > yU_out[i, j] for j in other_classes):
-                print(f"樣本 {i} 驗證失敗，從下一個timestep {next_timestep}往後找split對象")
-                
-                # 遞迴調用，使用對應子區間的X, eps和bounds狀態
-                return self._recursive_split_verify(
-                    X, eps, top1_class, split_count + 1, max_splits, 
-                    next_timestep, refine_preh
-                )
-        
-        # 所有樣本都驗證成功
-        print(f"當前子區間所有樣本驗證成功")
-        return True
+                failed_samples.append(i)
+
+        if failed_samples:
+            logger.info(f"Region {region_type}: {len(failed_samples)}個 samples 驗證失敗, 從下一個 timestep {next_timestep}往下尋找切分timestep")
+
+            # 紀錄遞迴前的output bounds
+            # self.record_split_bounds(yL_out, yU_out, None, None, 
+            #                         next_timestep-1, top1_class, f"{region_type}_before_split")
             
+            return self._recursive_split_verify(
+                X, eps, top1_class, split_count + 1, max_splits,
+                start_timestep=next_timestep, refine_preh=refine_preh
+            )
+
+        # 所有樣本都驗證成功
+        logger.info(f"Region {region_type}: 當前子區間所有樣本驗證成功")
+        return True
+    
+    def record_split_bounds(self, pos_yL_out, pos_yU_out, neg_yL_out, neg_yU_out,
+                            timestep, top1_class, split_type):
+        """紀錄split後的output bounds"""
+        split_record = {
+            'split_count': self.bound_tracker['current_split_count'], # 目前切了幾次
+            'timestep': timestep,
+            'split_type': split_type, # 目前在哪個階段：有分Original, Positive, Negative 以及 Pos_Neg_Split(獲得正負區間的output bounds之後)
+            'pos_output_bounds': {'pos_yL': pos_yL_out.clone(), 'pos_yU': pos_yU_out.clone()}, # 正區間的output bounds
+            'improvements': self.compute_bounds_improve(pos_yL_out, pos_yU_out, top1_class), # List
+        }
+
+        if neg_yL_out is not None and neg_yU_out is not None:
+            split_record['neg_output_bounds'] = {
+                'neg_yL': neg_yL_out.clone(),
+                'neg_yU': neg_yU_out.clone()
+            }
+            split_record['neg_improvements'] = self.compute_bounds_improve(neg_yL_out, neg_yU_out, top1_class)
+
+        self.bound_tracker['split_history'].append(split_record)
+
+        # 即時log當前改進狀況
+        self.log_bounds_analysis(pos_yL_out, pos_yU_out,
+            top1_class, f"Split {self.bound_tracker['current_split_count']}"
+        )
+
+    def compute_bounds_improve(self, yL_out, yU_out, top1_class):
+        """計算相對於原始output bounds的改進狀況"""
+        if self.bound_tracker['output_bounds'] is None:
+            return {}
+        
+        original_yL = self.bound_tracker['output_bounds']['yL']
+        original_yU = self.bound_tracker['output_bounds']['yU']
+
+        N = yL_out.shape[0]
+        improvements = []
+
+        for i in range(N):
+            top1 = top1_class[i]
+            other_classes = [j for j in range(self.output_size) if j != top1]
+
+            sample_improvement = {
+                'sample_idx': i,
+                'top1_class': top1.item(),
+                'original_safe': all(original_yL[i, top1] > original_yU[i, j] for j in other_classes),
+                'split_safe': all(yL_out[i, top1] > yU_out[i, j] for j in other_classes),
+            }
+
+            # 1.計算安全邊界(Worst-Case Gap Reduction)變化
+            original_margin = original_yL[i, top1] - max([original_yU[i, j] for j in other_classes])
+            current_margin = yL_out[i, top1] - max([yU_out[i, j] for j in other_classes])
+            sample_improvement['margin_improvement'] = (current_margin - original_margin)
+
+            # 2.將Improvements拆成：top1 yL提高量 + 其他class yU降低量
+            original_yL_top1_imp = yL_out[i, top1] - original_yL[i, top1]
+            sample_improvement['top1_yL_improvement'] = original_yL_top1_imp.item()
+            other_class_yU_decrease = [original_yU[i, j] - yU_out[i, j] for j in other_classes]
+            total_other_yU_decrease = sum(other_class_yU_decrease).item()
+            sample_improvement['other_class_yU_decrease'] = total_other_yU_decrease
+
+            improvements.append(sample_improvement)
+
+        return improvements
+    
+    def log_bounds_analysis(self, yL_out, yU_out, top1_class, stage_name):
+
+        logger.info(f"\n--- {stage_name} Bounds Analysis ---")
+
+        if self.bound_tracker['output_bounds'] is None:
+            logger.info("Recording original bounds as baseline")
+            return
+        
+        original_yL = self.bound_tracker['output_bounds']['yL']
+        original_yU = self.bound_tracker['output_bounds']['yU']
+
+        N = yL_out.shape[0]
+        improved_samples = 0 # 改善的sample數量
+        total_improvements = 0 # bound對每個維度的改善總和
+        false_positive_risk = 0 # 原先POPQORN無法驗證但split完之後有驗證成功
+        N_safe_original = 0
+        N_safe_split = 0
+        N_unsafe_original = 0
+        N_unsafe_to_safe = 0
+        
+        # 整體的improvements check
+        for i in range(N):
+            imp_check_list = [] # for每個sample裡面的top1 class與其他class的output bounds改善程度
+            top1 = top1_class[i]
+            other_classes = [j for j in range(self.output_size) if j != top1]
+
+            # 未split前的output bounds安全結果
+            original_safe = all(original_yL[i, top1] > original_yU[i, j] for j in other_classes)
+            N_safe_original += int(original_safe)
+            # split後的output bounds安全結果
+            split_safe = all(yL_out[i, top1] > yU_out[i, j] for j in other_classes)
+            N_safe_split += int(split_safe)
+            N_unsafe_original += int(not original_safe)
+            N_unsafe_to_safe += int(split_safe and not original_safe)
+
+            # 檢查改進
+            for j in other_classes:
+                original_violation = original_yU[i, j] - original_yL[i, top1]
+                split_violation = yU_out[i, j] - yL_out[i, top1]
+                improvement = original_violation - split_violation
+                imp_check_list.append(improvement)
+
+            # 全部都是正數代表此sample有改善
+            if all(imp > 1e-6 for imp in imp_check_list):
+                improved_samples += 1
+                total_improvements += sum(imp_check_list)
+
+            # 檢查是否有false positive風險
+            if split_safe and not original_safe:
+                false_positive_risk += 1
+                logger.warning(f"Sample {i} has false positive risk after split: ")
+
+        # 統計報告
+        logger.info(f"Samples with bound improvement: {improved_samples}/{N}")
+        if improved_samples > 0:
+            avg_improvement = total_improvements / improved_samples
+            logger.info(f"Average bounds improvement: {avg_improvement:.6f}")
+
+        if false_positive_risk > 0:
+            logger.warning(f"Potential false positive samples: {false_positive_risk}/{N}")
+
+        logger.info(f"Original safe samples: {N_safe_original}/{N}")
+        logger.info(f"Unsafe samples before split: {N_unsafe_original}/{N}")
+        logger.info(f"Safe samples after split: {N_safe_split}/{N}")
+        logger.info(f"Unsafe samples to safe after split: {N_unsafe_to_safe}/{N}")
+
+        logger.info(f"Current stage verification rate: {sum(1 for i in range(N) if all(yL_out[i, top1_class[i]] > yU_out[i, j] for j in range(self.output_size) if j != top1_class[i]))}/{N}")
+
+    def generate_final_report(self):
+        """生成最終的驗證報告"""
+        
+        logger.info(f"\n{'='*80}")
+        logger.info("FINAL BOUNDS IMPROVEMENT REPORT")
+        logger.info(f"{'='*80}")
+
+        if not self.bound_tracker['split_history']:
+            logger.info("No splits were performed")
+            return
+        
+        # 總體統計
+        total_splits = len(self.bound_tracker['split_history'])
+        final_split = self.bound_tracker['split_history'][-1]
+
+        logger.info(f"Total splits performed: {total_splits}")
+        logger.info(f"Final split timestep: {final_split['timestep']}")
+
+        # 分析最終改進 - 使用三大指標
+        if 'improvements' in final_split:
+            improvements = final_split['improvements']
+            N = len(improvements)
+
+            # 指標一：最差情況間隙縮減量 (Worst-Case Gap Reduction)
+            worst_gap_improvements = []
+            samples_gap_improved = 0
+            samples_unsafe_to_safe = 0
+            
+            # 指標二：改進來源分解 (Decomposition of Improvement Sources)
+            total_top1_yL_improvement = 0
+            total_other_yU_decrease = 0
+            samples_with_top1_improvement = 0
+            samples_with_other_decrease = 0
+            
+            # 指標三：驗證狀態轉變率 (Verification Status Change Rate)
+            N_safe_original = 0
+            N_safe_split = 0
+            N_unsafe_original = 0
+            false_positive_count = 0
+
+            for imp in improvements:
+                # 指標一：計算最差情況間隙縮減
+                margin_improvement = imp['margin_improvement'].item()
+                worst_gap_improvements.append(margin_improvement)
+                
+                if margin_improvement > 1e-6:
+                    samples_gap_improved += 1
+                
+                # 指標二：改進來源分解
+                top1_improvement = imp['top1_yL_improvement']
+                other_decrease = imp['other_class_yU_decrease'] 
+                
+                if top1_improvement > 1e-6:
+                    total_top1_yL_improvement += top1_improvement
+                    samples_with_top1_improvement += 1
+                    
+                if other_decrease > 1e-6:
+                    total_other_yU_decrease += other_decrease
+                    samples_with_other_decrease += 1
+                
+                # 指標三：驗證狀態統計
+                original_safe = imp['original_safe']
+                split_safe = imp['split_safe']
+                
+                N_safe_original += int(original_safe)
+                N_safe_split += int(split_safe)
+                N_unsafe_original += int(not original_safe)
+                
+                # 檢查從不安全轉為安全
+                if split_safe and not original_safe:
+                    samples_unsafe_to_safe += 1
+                    
+                # 檢查false positive
+                if split_safe and not original_safe:
+                    false_positive_count += 1
+
+            # === 報告三大指標 ===
+            logger.info(f"\n=== 指標一：最差情況間隙縮減量 (Worst-Case Gap Reduction) ===")
+            logger.info(f"  ├─ Samples with gap reduction: {samples_gap_improved}/{N}")
+            if samples_gap_improved > 0:
+                avg_gap_reduction = sum(imp for imp in worst_gap_improvements if imp > 1e-6) / samples_gap_improved
+                max_gap_reduction = max(worst_gap_improvements)
+                logger.info(f"  ├─ Average gap reduction: {avg_gap_reduction:.6f}")
+                logger.info(f"  └─ Maximum gap reduction: {max_gap_reduction:.6f}")
+            else:
+                logger.info(f"  └─ No significant gap reduction achieved")
+
+            logger.info(f"\n=== 指標二：改進來源分解 (Decomposition of Improvement Sources) ===")
+            logger.info(f"  ├─ Top-1 lower bound improvements:")
+            logger.info(f"  │   ├─ Samples improved: {samples_with_top1_improvement}/{N}")
+            if samples_with_top1_improvement > 0:
+                avg_top1_improvement = total_top1_yL_improvement / samples_with_top1_improvement
+                logger.info(f"  │   └─ Average improvement: {avg_top1_improvement:.6f}")
+            else:
+                logger.info(f"  │   └─ Average improvement: 0")
+                
+            logger.info(f"  ├─ Other classes upper bound reductions:")
+            logger.info(f"  │   ├─ Samples improved: {samples_with_other_decrease}/{N}")
+            if samples_with_other_decrease > 0:
+                avg_other_decrease = total_other_yU_decrease / samples_with_other_decrease
+                logger.info(f"  │   └─ Average reduction: {avg_other_decrease:.6f}")
+            else:
+                logger.info(f"  │   └─ Average reduction: 0")
+                
+            # 改進來源比例分析
+            total_improvement_sources = samples_with_top1_improvement + samples_with_other_decrease
+            if total_improvement_sources > 0:
+                top1_contribution_rate = samples_with_top1_improvement / total_improvement_sources * 100
+                other_contribution_rate = samples_with_other_decrease / total_improvement_sources * 100
+                logger.info(f"  └─ Improvement source analysis:")
+                logger.info(f"      ├─ Top-1 enhancement contribution: {top1_contribution_rate:.1f}%")
+                logger.info(f"      └─ Other classes suppression contribution: {other_contribution_rate:.1f}%")
+
+            logger.info(f"\n=== 指標三：驗證狀態轉變率 (Verification Status Change Rate) ===")
+            logger.info(f"  ├─ Original verification status:")
+            logger.info(f"  │   ├─ Safe samples: {N_safe_original}/{N} ({N_safe_original/N*100:.1f}%)")
+            logger.info(f"  │   └─ Unsafe samples: {N_unsafe_original}/{N} ({N_unsafe_original/N*100:.1f}%)")
+            logger.info(f"  ├─ After split verification status:")
+            logger.info(f"  │   └─ Safe samples: {N_safe_split}/{N} ({N_safe_split/N*100:.1f}%)")
+            logger.info(f"  ├─ Verification improvement:")
+            logger.info(f"  │   ├─ Unsafe to safe conversions: {samples_unsafe_to_safe}/{N_unsafe_original}")
+            
+            if N_unsafe_original > 0:
+                success_rate = samples_unsafe_to_safe / N_unsafe_original * 100
+                logger.info(f"  │   └─ Conversion success rate: {success_rate:.1f}%")
+            else:
+                logger.info(f"  │   └─ Conversion success rate: N/A (no unsafe samples initially)")
+                
+            logger.info(f"  └─ Overall improvement rate: {(N_safe_split - N_safe_original)/N*100:.1f}%")
+
+            # === 風險評估 ===
+            if false_positive_count > 0:
+                logger.warning(f"\n⚠️  RISK ASSESSMENT:")
+                logger.warning(f"   └─ Potential false positive samples: {false_positive_count}/{N} ({false_positive_count/N*100:.1f}%)")
+                logger.warning(f"       These samples changed from unsafe to safe - please verify manually!")
+            else:
+                logger.info(f"\n✅ RISK ASSESSMENT: No false positive risks detected")
+
+            # === 總體評估 ===
+            logger.info(f"\n=== 總體效能評估 ===")
+            overall_effectiveness = (samples_gap_improved + samples_unsafe_to_safe) / (2 * N) * 100
+            logger.info(f"  ├─ Gap reduction effectiveness: {samples_gap_improved/N*100:.1f}%")
+            logger.info(f"  ├─ Safety conversion effectiveness: {samples_unsafe_to_safe/N*100:.1f}%")
+            logger.info(f"  └─ Overall refinement effectiveness: {overall_effectiveness:.1f}%")
+
+        else:
+            logger.warning("No improvement data available in final split record")
+
 def create_toy_rnn(verifier):
     with torch.no_grad():
         verifier.rnn = None
@@ -857,7 +1378,7 @@ def create_toy_rnn(verifier):
         verifier.a_0 = torch.tensor([0.0], dtype=torch.float32)
         
         verifier.W_ax = torch.tensor([
-            [2.0],
+            [1.0],
         ], dtype=torch.float32)
         
         verifier.W_aa = torch.tensor([
@@ -987,24 +1508,49 @@ def main():
         
         verifier.extractWeight(clear_original_model=False)
 
-    print(f"\n=== Zero Split Verification (merge_results={args.merge_results}) ===")
+    # 設置結果保存和logger捕獲
+    json_file, txt_file, log_capture, session_dir = setup_result_logging(
+        args.work_dir, args.eps, args
+    )
+    
+    logger.info(f"Starting ZeroSplit verification")
+    logger.info(f"Model: {args.work_dir}")
+    logger.info(f"Config: eps={args.eps}, N={args.N}, max_splits={args.max_splits}")
+    logger.info(f"Results will be saved to: {session_dir}")
+
+    logger.info(f"\n=== Zero Split Verification (merge_results={args.merge_results}) ===")
     # is_verified, unsafe_layer, top1_class, yL_out, yU_out = verifier.verify_network(
     #     X, eps, merge_results=args.merge_results
     # )
     is_verified, unsafe_layer, top1_class = verifier.verify_network_recursive(
         X, eps, max_splits=args.max_splits
     )
+
+    # 準備結果數據
+    results_data = {
+        'is_verified': is_verified,
+        'unsafe_layer': unsafe_layer,
+        'top1_class': top1_class.tolist() if hasattr(top1_class, 'tolist') else int(top1_class),
+        'split_count': verifier.split_count
+    }
     
-    print(f"\n=== Results ===")
-    print(f"Predicted class: {top1_class}")
+    logger.info(f"\n=== Final Results ===")
+    logger.info(f"Predicted class: {top1_class}")
     if is_verified:
-        print(f"Verification successful!")
-        print(f"Split count: {verifier.split_count}")
+        logger.info(f"Verification successful!")
+        logger.info(f"Split count: {verifier.split_count}")
     else:
-        print(f"Verification failed")
+        logger.info(f"Verification failed")
         if unsafe_layer:
-            print(f"Unsafe layer: {unsafe_layer}")
-            print(f"Split count: {verifier.split_count}")
+            logger.info(f"Unsafe layer: {unsafe_layer}")
+            logger.info(f"Split count: {verifier.split_count}")
+    
+    # 保存結果（包含所有captured logs）
+    save_verification_results(json_file, txt_file, log_capture.captured_logs, args, results_data, session_dir)
+    
+    logger.info(f"\nResults saved to session: {os.path.basename(session_dir)}")
+    logger.info(f"JSON detail: {os.path.basename(json_file)}")
+    logger.info(f"TXT summary: {os.path.basename(txt_file)}")
 
 if __name__ == "__main__":
     main()

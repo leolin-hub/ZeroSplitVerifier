@@ -85,18 +85,17 @@ def save_results(all_results, output_dir, args):
         writer.writerow([
             'Dataset', 'Time_Step', 'N_Samples', 'Epsilon', 
             'POPQORN_Success', 'ZeroSplit_Success',
-            'POPQORN_Time', 'ZeroSplit_Time',
-            'ZeroSplit_Better', 'Improvement_Mean'
+            'POPQORN_Time', 'ZeroSplit_Time'
         ])
         
         # 寫入數據
         for result in all_results:
-            if result['popqorn_success'] and result['zerosplit_success']:
-                improvement_mean = float(result['improvement'].mean()) if torch.is_tensor(result['improvement']) else result['improvement']
-                zerosplit_better = improvement_mean < 0
-            else:
-                improvement_mean = 'N/A'
-                zerosplit_better = 'N/A'
+            # if result['popqorn_success'] and result['zerosplit_success']:
+            #     improvement_mean = float(result['improvement'].mean()) if torch.is_tensor(result['improvement']) else result['improvement']
+            #     zerosplit_better = improvement_mean < 0
+            # else:
+            #     improvement_mean = 'N/A'
+            #     zerosplit_better = 'N/A'
             
             writer.writerow([
                 result['dataset'],
@@ -106,9 +105,7 @@ def save_results(all_results, output_dir, args):
                 result['popqorn_success'],
                 result['zerosplit_success'],
                 f"{result['popqorn_time']:.4f}",
-                f"{result['zerosplit_time']:.4f}",
-                zerosplit_better,
-                improvement_mean
+                f"{result['zerosplit_time']:.4f}"
             ])
     
     return json_file, csv_file
@@ -149,26 +146,57 @@ def compute_popqorn_bounds(model, X, eps, p, Eps_idx=None):
         yL, yU = None, None
     return bounds_width, compute_time, success
 
-def compute_zerosplit_bounds(model, X, eps, merge_results=True):
+def compute_zerosplit_bounds(model, X, eps, max_splits=3, merge_results=False):
     start_time = time.time()
+
+    timing_data = {
+        'initial_time': 0,
+        'split_time': 0,
+        'total_splits': 0,
+        'total_time': 0
+    }
+
     try:
-        _, _, _, yL_out, yU_out = model.verify_network(X, eps, merge_results=merge_results)
-        compute_time = time.time() - start_time
-        bounds_width = (yU_out - yL_out)
-        success = True
+        
+        # 1. 初始驗證時間
+        initial_start = time.time()
+        initial_verified, top1_class, _, _ = model.verify_robustness(X, eps)
+        timing_data['initial_time'] = time.time() - initial_start
+        
+        if initial_verified:
+            # 無需split
+            timing_data['total_time'] = time.time() - start_time
+            yL_out, yU_out = model.computeLast2sideBound(
+                eps, p=2, v=model.time_step+1, X=X,
+                Eps_idx=torch.arange(1, model.time_step+1)
+            )
+            bounds_width = (yU_out - yL_out)
+            return bounds_width, timing_data['total_time'], True, timing_data
+        
+        # 2. 執行split驗證時間
+        split_start = time.time()
+        split_verified = model._recursive_split_verify(
+            X, eps, top1_class, split_count=0, max_splits=max_splits,
+            start_timestep=1, refine_preh=None
+        )
+        timing_data['split_time'] = time.time() - split_start
+        timing_data['total_splits'] = getattr(model, 'split_count', 0)
+        timing_data['total_time'] = time.time() - start_time
+        
+        return bounds_width, timing_data['total_time'], split_verified, timing_data
     except Exception as e:
-        compute_time = time.time() - start_time
+        timing_data['total_time'] = time.time() - start_time
         bounds_width = float('inf')
-        success = False
-        yL_out, yU_out = None, None
-    return bounds_width, compute_time, success
+        return bounds_width, timing_data['total_time'], False, timing_data
 
 def run_single_experiment(config, base_args):
     device = torch.device("cuda" if base_args.cuda and torch.cuda.is_available() else "cpu")
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Experiment: dataset={config['dataset']}, time_step={config['time_step']}, N={config['N']}, eps={config['eps_list']}")
-    logger.info(f"{'='*60}")
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Timing Analysis Experiment")
+    logger.info(f"Dataset: {config['dataset']} | Time_step: {config['time_step']} | N: {config['N']}")
+    logger.info(f"Epsilon values: {config['eps_list']}")
+    logger.info(f"{'='*80}")
 
     if config['dataset'] == 'stock':
         input_size = 1
@@ -216,20 +244,44 @@ def run_single_experiment(config, base_args):
     experiment_results = []
 
     for eps in config['eps_list']:
-        logger.info(f"\n--- Testing eps = {eps} ---")
+        logger.info(f"\nTesting epsilon = {eps}")
+        logger.info(f"{'─'*50}")
         
         # POPQORN
+        logger.info(f"Running POPQORN...")
         popqorn_model.clear_intermediate_variables()
         width_pop, time_pop, success_pop = compute_popqorn_bounds(
             popqorn_model, X, eps, base_args.p)
-
-        # ZeroSplit
+        
+        logger.info(f"POPQORN: time={time_pop:.4f}s, success={success_pop}")
+        
+        # ZeroSplit時間分析
+        logger.info(f"Running ZeroSplit (Timing Analysis)...")
         zerosplit_model.clear_intermediate_variables()
-        width_zero, time_zero, success_zero = compute_zerosplit_bounds(
-            zerosplit_model, X, eps, merge_results=True)
-
-        improvement = (width_pop - width_zero) if success_pop and success_zero else -1
-
+        width_zero, time_zero, success_zero, timing_data = compute_zerosplit_bounds(
+            zerosplit_model, X, eps, max_splits=3, merge_results=False)
+        
+        # 時間分析日誌
+        logger.info(f"ZeroSplit: time={time_zero:.4f}s, success={success_zero}")
+        logger.info(f"  Initial verification: {timing_data['initial_time']:.4f}s")
+        logger.info(f"  Split operations: {timing_data['split_time']:.4f}s")
+        logger.info(f"  Total splits: {timing_data['total_splits']}")
+        
+        if timing_data['total_splits'] > 0:
+            avg_split_time = timing_data['split_time'] / timing_data['total_splits']
+            logger.info(f"  Average time per split: {avg_split_time:.4f}s")
+        
+        # 效率比較
+        if success_pop and success_zero:
+            # improvement = (width_pop - width_zero)
+            # zerosplit_better = (improvement >= 0).all()
+            speedup = time_pop / time_zero if time_zero > 0 else float('inf')
+            
+            logger.info(f"Comparison results:")
+            # logger.info(f"  ZeroSplit better bounds: {zerosplit_better}")
+            logger.info(f"  Speed ratio: {speedup:.2f}x ({'faster' if speedup > 1 else 'slower'})")
+        
+        # 保存結果
         result = {
             'dataset': config['dataset'],
             'time_step': config['time_step'],
@@ -237,27 +289,19 @@ def run_single_experiment(config, base_args):
             'eps': eps,
             'popqorn_width': width_pop,
             'zerosplit_width': width_zero,
-            'improvement': improvement,
             'popqorn_time': time_pop,
             'zerosplit_time': time_zero,
             'popqorn_success': success_pop,
-            'zerosplit_success': success_zero
+            'zerosplit_success': success_zero,
+            'timing_data': timing_data
         }
         experiment_results.append(result)
-
-        logger.info(f"POPQORN: time={time_pop:.4f}s, success={success_pop}")
-        logger.info(f"ZeroSplit: time={time_zero:.4f}s, success={success_zero}")
-        
-        if success_pop and success_zero:
-            # 改進值>=0表示ZeroSplit更好或是不用切
-            all_not_negative = (improvement >= 0).all()
-            logger.info(f"ZeroSplit better or not split: {all_not_negative}")
 
     return experiment_results
 
 def generate_experiment_configs():
     # Experiment configurations
-    N_values = [10, 50, 100, 200]
+    N_values = [10, 50, 100]
 
     stock_time_steps = [10]
     stock_eps_configs = [
@@ -320,11 +364,11 @@ def summarize_results(all_results):
             
             if successful_results:
                 total_tests = len(successful_results)
-                zerosplit_wins = sum(1 for r in successful_results if (r['improvement'] >= 0).all())
+                # zerosplit_wins = sum(1 for r in successful_results if (r['improvement'] >= 0).all())
                 avg_time_popqorn = sum(r['popqorn_time'] for r in successful_results) / total_tests
                 avg_time_zerosplit = sum(r['zerosplit_time'] for r in successful_results) / total_tests
                 
-                logger.info(f"  Time_step {ts}: {zerosplit_wins}/{total_tests} wins ({zerosplit_wins/total_tests*100:.1f}%)")
+                # logger.info(f"  Time_step {ts}: {zerosplit_wins}/{total_tests} wins ({zerosplit_wins/total_tests*100:.1f}%)")
                 logger.info(f"    Avg time - POPQORN: {avg_time_popqorn:.4f}s, ZeroSplit: {avg_time_zerosplit:.4f}s")
 
 def main():

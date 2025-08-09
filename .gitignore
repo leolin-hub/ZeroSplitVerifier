@@ -3,3 +3,4 @@ __pycache__/
 *experiment_results/
 .vscode/
 data/
+*verification_results/
