@@ -58,6 +58,8 @@ def get_bound_for_relu(l, u, adaptive=False):
     return kl, bl, ku, bu
 
 def getConvenientGeneralActivationBound(l,u, activation, use_constant=False):
+    # 數值穩定性修正
+    u = torch.maximum(u, l + 1e-8)
     if (l>u).sum()>0:
         raise Exception('l must be less or equal to u')
         # print(l-u, (l-u).max())

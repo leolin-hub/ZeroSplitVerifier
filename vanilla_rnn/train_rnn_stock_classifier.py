@@ -26,6 +26,8 @@ def test_stock_rnn(model, device, test_loader):
     model.eval()
     test_loss = 0
     correct = 0
+    all_preds = []
+    all_targets = []
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
@@ -33,6 +35,12 @@ def test_stock_rnn(model, device, test_loader):
             test_loss += F.cross_entropy(output, target, reduction='sum').item()
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
+
+            all_preds.extend(pred.cpu().numpy().flatten())
+            all_targets.extend(target.cpu().numpy())
+
+    print(f"Prediction distribution: {Counter(all_preds)}")
+    print(f"Target distribution: {Counter(all_targets)}")
 
     test_loss /= len(test_loader.dataset)
     accuracy = 100. * correct / len(test_loader.dataset)
@@ -73,7 +81,7 @@ def main():
     train_data = torch.utils.data.TensorDataset(X_train, y_train)
     test_data = torch.utils.data.TensorDataset(X_test, y_test)
     
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=32, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=32, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_data, batch_size=32, shuffle=False)
     
     # 創建模型

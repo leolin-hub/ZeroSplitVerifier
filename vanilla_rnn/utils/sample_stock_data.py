@@ -34,9 +34,9 @@ def create_sliding_windows(data, window_size=10, train_end_idx=None):
     sequences = []
     sequence_labels = []
 
-    for i in range(len(normalize_prices) - window_size + 1):
-        seq = normalize_prices[i:i + window_size]
-        label = labels[i+window_size - 1]
+    for i in range(len(normalize_prices) - window_size):
+        seq = normalize_prices[i:i + window_size]      # 觀察期
+        label = labels[i + window_size]                # 下一天的行動
 
         sequences.append(seq)
         sequence_labels.append(label)

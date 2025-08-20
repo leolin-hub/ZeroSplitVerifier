@@ -14,10 +14,24 @@ from zerosplit_verifier import ZeroSplitVerifier
 from utils.sample_data import sample_mnist_data
 from utils.sample_stock_data import prepare_stock_tensors_split
 
-def setup_logging(output_dir):
-    """設置loguru日誌記錄"""
+def setup_performance_logging(hidden_size, activation):
+    """設置performance測試的資料夾結構，按hidden_size分類"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(output_dir, f"experiment_log_{timestamp}.txt")
+    
+    # 在當前目錄(vanilla_rnn)下建立experiment_results
+    current_dir = os.path.dirname(os.path.abspath(__file__))  # vanilla_rnn目錄
+    
+    # 按hidden_size建立分類資料夾
+    hidden_size_dir = os.path.join(current_dir, "experiment_results", f"hidden_{hidden_size}_{activation}")
+    session_dir = os.path.join(hidden_size_dir, f"session_{timestamp}")
+    os.makedirs(session_dir, exist_ok=True)
+    
+    return session_dir, hidden_size_dir
+
+def setup_logging(session_dir):
+    """設置loguru日誌記錄(修改版)"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(session_dir, f"experiment_log_{timestamp}.txt")
 
     # 移除默認handler
     logger.remove()
@@ -39,21 +53,27 @@ def setup_logging(output_dir):
     
     return log_file
 
-def save_results(all_results, output_dir, args):
-    """保存實驗結果"""
+def save_results(all_results, session_dir, args):
+    """保存實驗結果(修改版)"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
+    # 建立檔案名稱，包含配置資訊
+    base_name = f"comparison_h{args.hidden_size}_{args.activation}_p{args.p}_{timestamp}"
+    
     # 1. 保存詳細結果為JSON
-    json_file = os.path.join(output_dir, f"detailed_results_{timestamp}.json")
+    json_file = os.path.join(session_dir, f"{base_name}.json")
     
     # 準備保存的數據
     save_data = {
         'experiment_info': {
             'timestamp': timestamp,
+            'session_dir': session_dir,
             'hidden_size': args.hidden_size,
             'activation': args.activation,
             'p_norm': args.p,
-            'total_experiments': len(all_results)
+            'model_base_dir': args.model_base_dir,
+            'total_experiments': len(all_results),
+            'experiment_type': 'performance_comparison'
         },
         'results': []
     }
@@ -76,7 +96,7 @@ def save_results(all_results, output_dir, args):
         json.dump(save_data, f, indent=2, ensure_ascii=False)
     
     # 2. 保存統計摘要為CSV
-    csv_file = os.path.join(output_dir, f"summary_results_{timestamp}.csv")
+    csv_file = os.path.join(session_dir, f"{base_name}.csv")
     
     with open(csv_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -85,17 +105,15 @@ def save_results(all_results, output_dir, args):
         writer.writerow([
             'Dataset', 'Time_Step', 'N_Samples', 'Epsilon', 
             'POPQORN_Success', 'ZeroSplit_Success',
-            'POPQORN_Time', 'ZeroSplit_Time'
+            'POPQORN_Time', 'ZeroSplit_Time', 'Speed_Ratio',
+            'Initial_Time', 'Split_Time', 'Total_Splits'
         ])
         
         # 寫入數據
         for result in all_results:
-            # if result['popqorn_success'] and result['zerosplit_success']:
-            #     improvement_mean = float(result['improvement'].mean()) if torch.is_tensor(result['improvement']) else result['improvement']
-            #     zerosplit_better = improvement_mean < 0
-            # else:
-            #     improvement_mean = 'N/A'
-            #     zerosplit_better = 'N/A'
+            speed_ratio = result['popqorn_time'] / result['zerosplit_time'] if result['zerosplit_time'] > 0 else float('inf')
+            
+            timing_data = result.get('timing_data', {})
             
             writer.writerow([
                 result['dataset'],
@@ -105,10 +123,57 @@ def save_results(all_results, output_dir, args):
                 result['popqorn_success'],
                 result['zerosplit_success'],
                 f"{result['popqorn_time']:.4f}",
-                f"{result['zerosplit_time']:.4f}"
+                f"{result['zerosplit_time']:.4f}",
+                f"{speed_ratio:.2f}",
+                f"{timing_data.get('initial_time', 0):.4f}",
+                f"{timing_data.get('split_time', 0):.4f}",
+                timing_data.get('total_splits', 0)
             ])
     
-    return json_file, csv_file
+    # 3. 保存TXT摘要報告
+    txt_file = os.path.join(session_dir, f"{base_name}_summary.txt")
+    
+    with open(txt_file, 'w', encoding='utf-8') as f:
+        f.write(f"Performance Comparison Report\n")
+        f.write(f"{'='*80}\n")
+        f.write(f"Session: {os.path.basename(session_dir)}\n")
+        f.write(f"Timestamp: {save_data['experiment_info']['timestamp']}\n")
+        f.write(f"Configuration: hidden_size={args.hidden_size}, activation={args.activation}, p_norm={args.p}\n")
+        f.write(f"Total experiments: {len(all_results)}\n\n")
+        
+        # 成功率統計
+        successful_results = [r for r in all_results if r['popqorn_success'] and r['zerosplit_success']]
+        f.write(f"Success Statistics:\n")
+        f.write(f"{'-'*40}\n")
+        f.write(f"Total experiments: {len(all_results)}\n")
+        f.write(f"Both successful: {len(successful_results)}\n")
+        f.write(f"Success rate: {len(successful_results)/len(all_results)*100:.1f}%\n\n")
+        
+        if successful_results:
+            # 按dataset分組統計
+            for dataset in ['stock', 'mnist']:
+                dataset_results = [r for r in successful_results if r['dataset'] == dataset]
+                if not dataset_results:
+                    continue
+                    
+                f.write(f"{dataset.upper()} Dataset Performance:\n")
+                f.write(f"{'-'*40}\n")
+                
+                avg_popqorn = sum(r['popqorn_time'] for r in dataset_results) / len(dataset_results)
+                avg_zerosplit = sum(r['zerosplit_time'] for r in dataset_results) / len(dataset_results)
+                avg_speedup = avg_popqorn / avg_zerosplit if avg_zerosplit > 0 else float('inf')
+                
+                f.write(f"  Experiments: {len(dataset_results)}\n")
+                f.write(f"  Avg POPQORN time: {avg_popqorn:.4f}s\n")
+                f.write(f"  Avg ZeroSplit time: {avg_zerosplit:.4f}s\n")
+                f.write(f"  Avg speedup: {avg_speedup:.2f}x\n")
+                
+                # Split統計
+                total_splits = sum(r.get('timing_data', {}).get('total_splits', 0) for r in dataset_results)
+                f.write(f"  Total splits: {total_splits}\n")
+                f.write(f"  Avg splits per experiment: {total_splits/len(dataset_results):.1f}\n\n")
+    
+    return json_file, csv_file, txt_file
 
 def build_model_path(base_dir, dataset, time_step, hidden_size, activation):
     """根據資料集類型和模型參數動態構建模型路徑"""
@@ -259,7 +324,7 @@ def run_single_experiment(config, base_args):
         logger.info(f"Running ZeroSplit (Timing Analysis)...")
         zerosplit_model.clear_intermediate_variables()
         width_zero, time_zero, success_zero, timing_data = compute_zerosplit_bounds(
-            zerosplit_model, X, eps, max_splits=3, merge_results=False)
+            zerosplit_model, X, eps, max_splits=127, merge_results=False)
         
         # 時間分析日誌
         logger.info(f"ZeroSplit: time={time_zero:.4f}s, success={success_zero}")
@@ -310,7 +375,7 @@ def generate_experiment_configs():
         [3.0, 4.0, 5.0]
     ]
 
-    mnist_time_steps = [2, 7]
+    mnist_time_steps = [2, 4, 7]
     mnist_eps_configs = [
         [0.01, 0.05, 0.1],
         [0.1, 0.2, 0.3],
@@ -388,11 +453,6 @@ def main():
     parser.add_argument('--stock-data-path', default='C:/Users/zxczx/POPQORN/vanilla_rnn/utils/A1_bin.csv')
     parser.add_argument('--mnist-data-path', default='../data/mnist', 
                        help='Path to MNIST data directory')
-    
-    # Output Parameters
-    parser.add_argument('--output-dir', default='./experiment_results/', 
-                       help='Directory to save results and logs')
-
 
     # Experiment Control
     parser.add_argument('--quick-test', action='store_true', 
@@ -400,16 +460,18 @@ def main():
     
     args = parser.parse_args()
 
-    # 創建輸出目錄
-    os.makedirs(args.output_dir, exist_ok=True)
+    # === 修改的部分：建立按hidden_size分類的資料夾 ===
+    session_dir, hidden_size_dir = setup_performance_logging(args.hidden_size, args.activation)
     
     # 設置loguru日誌
-    log_file = setup_logging(args.output_dir)
+    log_file = setup_logging(session_dir)
     
-    logger.info(f"Experiment started at {datetime.now()}")
+    logger.info(f"Performance Comparison Experiment Started")
+    logger.info(f"{'='*80}")
     logger.info(f"Model configuration: hidden_size={args.hidden_size}, activation={args.activation}")
-    logger.info(f"Results will be saved to: {args.output_dir}")
-    logger.info(f"Log file: {log_file}")
+    logger.info(f"Results organized by: {os.path.basename(hidden_size_dir)}")
+    logger.info(f"Current session: {os.path.basename(session_dir)}")
+    logger.info(f"Log file: {os.path.basename(log_file)}")
 
     # Generate all experiment configurations
     all_configs = generate_experiment_configs()
@@ -434,13 +496,14 @@ def main():
     # Summarize all results
     summarize_results(all_results)
     
-    # Save results
+    # === 修改的部分：使用新的save_results函數 ===
     if all_results:
-        json_file, csv_file = save_results(all_results, args.output_dir, args)
-        logger.info(f"\nResults saved:")
-        logger.info(f"  Detailed results (JSON): {json_file}")
-        logger.info(f"  Summary results (CSV): {csv_file}")
-        logger.info(f"  Log file: {log_file}")
+        json_file, csv_file, txt_file = save_results(all_results, session_dir, args)
+        logger.info(f"\nResults saved to session: {os.path.basename(session_dir)}")
+        logger.info(f"  Detailed results (JSON): {os.path.basename(json_file)}")
+        logger.info(f"  Summary results (CSV): {os.path.basename(csv_file)}")
+        logger.info(f"  Report summary (TXT): {os.path.basename(txt_file)}")
+        logger.info(f"  Log file: {os.path.basename(log_file)}")
     else:
         logger.warning("No results to save!")
     

@@ -273,6 +273,7 @@ class ZeroSplitVerifier(RNN):
                 # eps is a number
                 yU = yU + idx_eps[v-1] * eps * torch.norm(W_ax, p=q, dim=2)
                 yL = yL - idx_eps[v-1] * eps * torch.norm(W_ax, p=q, dim=2)
+            print(f"Norm: {torch.norm(W_ax, p=q, dim=2)}")
                 
             # 第二項: A^{<v>} W_ax x^{<v>} and Ou^{<v>} W_ax x^{<v>}
             if v == 1:
@@ -466,7 +467,7 @@ class ZeroSplitVerifier(RNN):
         orig_l = self.l[v].clone().detach()
         orig_u = self.u[v].clone().detach()
         full_X = self.original_X.clone().detach()
-        print(f"full_X shape: {full_X.shape}")
+        # print(f"full_X shape: {full_X.shape}")
 
         cur_v_input_l = self.input_yL
         cur_v_input_u = self.input_yU
@@ -485,7 +486,7 @@ class ZeroSplitVerifier(RNN):
 
         # 得到正負區間新的input和epsilon
         X_pos, X_neg, eps_pos, eps_neg = self.adjust_eps_input_for_split(cur_v_input_l, cur_v_input_u, full_X, eps,  v, p)
-        print(f"X_pos shape: {X_pos.shape}")
+        # print(f"X_pos shape: {X_pos.shape}")
         # self.l[v] = pos_l
         # self.u[v] = pos_u
 
@@ -510,7 +511,7 @@ class ZeroSplitVerifier(RNN):
                 eps_pos, p, v=self.time_step+1, X=X_pos, Eps_idx=Eps_idx
             )
             # print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
-            print(f"正區間的bounds差異: {pos_yU - pos_yL}")
+            # print(f"正區間的bounds差異: {pos_yU - pos_yL}")
         else:
             # 確保一直到最後一timestep才切的時候，self.l和self.u有被正確更新
             if pos_l_state is not None:
@@ -527,7 +528,7 @@ class ZeroSplitVerifier(RNN):
                 eps_pos, p, v=self.time_step+1, X=X_pos, Eps_idx=Eps_idx
             )
             # print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
-            print(f"正區間的bounds差異: {pos_yU - pos_yL}")
+            # print(f"正區間的bounds差異: {pos_yU - pos_yL}")
         
         # 負區間: x <= 0
         neg_l = orig_l.clone().detach()
@@ -558,7 +559,7 @@ class ZeroSplitVerifier(RNN):
                 eps_neg, p, v=self.time_step+1, X=X_neg, Eps_idx=Eps_idx
             )
             # print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
-            print(f"負區間的bounds差異: {neg_yU - neg_yL}")
+            # print(f"負區間的bounds差異: {neg_yU - neg_yL}")
         else:
             # 確保一直到最後一timestep才切的時候，self.l和self.u有被正確更新
             if neg_l_state is not None:
@@ -575,7 +576,7 @@ class ZeroSplitVerifier(RNN):
                 eps_neg, p, v=self.time_step+1, X=X_neg, Eps_idx=Eps_idx
             )
             # print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
-            print(f"負區間的bounds差異: {neg_yU - neg_yL}")
+            # print(f"負區間的bounds差異: {neg_yU - neg_yL}")
         
         # 恢復原始bounds
         # self.l[v] = orig_l
@@ -818,13 +819,13 @@ class ZeroSplitVerifier(RNN):
         # 2. 計算bound
         yL, yU = self.computePreactivationBounds(eps, p=2, X=X, 
                                         Eps_idx=torch.arange(1,self.time_step+1))
-        print(f"不做split的隱藏層bounds to verify: {yL}, {yU}")
+        # print(f"不做split的隱藏層bounds to verify: {yL}, {yU}")
         
         yL_out, yU_out = self.computeLast2sideBound(eps, p=2, v=self.time_step+1,
                                                 X=X, Eps_idx=torch.arange(1,self.time_step+1))
         
-        print(f"不做split的輸出層 bounds to verify: {yL_out}, {yU_out}")
-        print(f"First time difference between yL and yU: {yU_out - yL_out}")
+        # print(f"不做split的輸出層 bounds to verify: {yL_out}, {yU_out}")
+        # print(f"First time difference between yL and yU: {yU_out - yL_out}")
 
         # 3. 檢查robustness
         N = X.shape[0]
@@ -1025,7 +1026,7 @@ class ZeroSplitVerifier(RNN):
             logger.info("沒有找到unsafe layer")
             return True
 
-        logger.info(f"Found unsafe layer: {unsafe_layer} with {cross_zero.sum()} dims crossing zero")
+        logger.info(f"Found unsafe layer: Layer {unsafe_layer} with total N * h {cross_zero.sum()} dims crossing zero")
 
         # 在unsafe layer split為正負兩區域 (Input取到unsafe_layer，之後會調整X和eps)
         pos_bounds, neg_bounds, pos_input, neg_input = self.compute2sideBound(
@@ -1039,6 +1040,9 @@ class ZeroSplitVerifier(RNN):
         (neg_yL_out, neg_yU_out) = neg_bounds
         (X_pos, eps_pos, pos_bounds_state) = pos_input
         (X_neg, eps_neg, neg_bounds_state) = neg_input
+
+        # 新增Union檢查
+        self._check_union_robust(pos_yL_out, pos_yU_out, neg_yL_out, neg_yU_out, top1_class, unsafe_layer)
 
         # 紀錄split完的output bounds
         self.bound_tracker['current_split_count'] = split_count + 1
@@ -1091,6 +1095,73 @@ class ZeroSplitVerifier(RNN):
         # 所有樣本都驗證成功
         logger.info(f"Region {region_type}: 當前子區間所有樣本驗證成功")
         return True
+    
+    def _check_union_robust(self, pos_yL, pos_yU, neg_yL, neg_yU, top1_class, unsafe_layer):
+        """檢查union後的驗證結果，檢查refinement方法的正確性"""
+        N = pos_yL.shape[0]
+        results = {
+            'pos_safe_samples': [],
+            'neg_safe_samples': [],
+            'union_unsafe_samples': [],
+            'doubt_samples': [], # 正負區間都安全但union不安全
+            'over_ori_bounds': []
+        }
+
+        original_yL = self.bound_tracker['output_bounds']['yL']
+        original_yU = self.bound_tracker['output_bounds']['yU']
+
+        for i in range(N):
+            top1 = top1_class[i]
+            other_classes = [j for j in range(self.output_size) if j != top1]
+
+            pos_contain = torch.all(pos_yL[i] >= original_yL[i]) and torch.all(pos_yU[i] <= original_yU[i])
+            neg_contain = torch.all(neg_yL[i] >= original_yL[i]) and torch.all(neg_yU[i] <= original_yU[i])
+
+            if not pos_contain or not neg_contain:
+                results['over_ori_bounds'].append(i)
+                logger.warning(f"Sample {i}: bounds containment violated!")
+                logger.warning(f"  Original: yL={original_yL[i]}, yU={original_yU[i]}")
+                logger.warning(f"  Pos: yL={pos_yL[i]}, yU={pos_yU[i]}, contained={pos_contain}")
+                logger.warning(f"  Neg: yL={neg_yL[i]}, yU={neg_yU[i]}, contained={neg_contain}")
+
+            # 檢查各區間驗證結果
+            pos_safe = all(pos_yL[i, top1] > pos_yU[i, j] for j in other_classes)
+            neg_safe = all(neg_yL[i, top1] > neg_yU[i, j] for j in other_classes)
+
+            # 計算union bounds (worst case)
+            union_yL = torch.minimum(pos_yL[i], neg_yL[i])
+            union_yU = torch.maximum(pos_yU[i], neg_yU[i])
+            union_safe = all(union_yL[top1] > union_yU[j] for j in other_classes)
+
+            if pos_safe:
+                results['pos_safe_samples'].append(i)
+            if neg_safe:
+                results['neg_safe_samples'].append(i)
+            if not union_safe:
+                results['union_unsafe_samples'].append(i)
+
+            if pos_safe and neg_safe and not union_safe:
+                results['doubt_samples'].append(i)
+                logger.warning(f"Sample {i+1} at layer {unsafe_layer}: pos=safe, neg=safe, union=unsafe")
+                logger.warning(f"  pos_bounds: yL={pos_yL[i]}, yU={pos_yU[i]}")
+                logger.warning(f"  neg_bounds: yL={neg_yL[i]}, yU={neg_yU[i]}")
+                logger.warning(f"  union_bounds: yL={union_yL}, yU={union_yU}")
+
+        # 統計
+        total_pos_safe = len(results['pos_safe_samples'])
+        total_neg_safe = len(results['neg_safe_samples'])
+        total_union_unsafe = len(results['union_unsafe_samples'])
+        total_doubt = len(results['doubt_samples'])
+
+        logger.info(f"Union verification check at layer {unsafe_layer}:")
+        logger.info(f"  Pos safe: {total_pos_safe}/{N}")
+        logger.info(f"  Neg safe: {total_neg_safe}/{N}")
+        logger.info(f"  Union unsafe: {total_union_unsafe}/{N}")
+        logger.info(f"  Suspicious (pos+neg safe, union unsafe): {total_doubt}/{N}")
+
+        if total_doubt > 0:
+            logger.error(f"Found {total_doubt} doubt samples - refinement method may be incorrect!")
+        return results
     
     def record_split_bounds(self, pos_yL_out, pos_yU_out, neg_yL_out, neg_yU_out,
                             timestep, top1_class, split_type):
@@ -1205,16 +1276,12 @@ class ZeroSplitVerifier(RNN):
             # 檢查是否有false positive風險
             if split_safe and not original_safe:
                 false_positive_risk += 1
-                logger.warning(f"Sample {i} has false positive risk after split: ")
 
         # 統計報告
         logger.info(f"Samples with bound improvement: {improved_samples}/{N}")
         if improved_samples > 0:
             avg_improvement = total_improvements / improved_samples
             logger.info(f"Average bounds improvement: {avg_improvement:.6f}")
-
-        if false_positive_risk > 0:
-            logger.warning(f"Potential false positive samples: {false_positive_risk}/{N}")
 
         logger.info(f"Original safe samples: {N_safe_original}/{N}")
         logger.info(f"Unsafe samples before split: {N_unsafe_original}/{N}")
@@ -1493,6 +1560,12 @@ def main():
             N=N, seq_len=time_step, device=device,
             data_dir='../data/mnist', train=False, shuffle=True, rnn=verifier
         )
+        torch.set_printoptions(
+            threshold=float('inf'),  # 顯示所有元素
+            linewidth=200,          # 每行字符數
+            edgeitems=10           # 邊緣顯示的元素數
+        )
+        print(f"{X[0]}")
         # X_train, y_train, target_train_label, _, _, _  = prepare_stock_tensors_split(
         #     csv_path='C:/Users/zxczx/POPQORN/vanilla_rnn/utils/A1_bin.csv',
         #     window_size=time_step,
@@ -1538,12 +1611,12 @@ def main():
     logger.info(f"Predicted class: {top1_class}")
     if is_verified:
         logger.info(f"Verification successful!")
-        logger.info(f"Split count: {verifier.split_count}")
+        logger.info(f"Split count: {len(verifier.bound_tracker['split_history'])}")
     else:
         logger.info(f"Verification failed")
         if unsafe_layer:
             logger.info(f"Unsafe layer: {unsafe_layer}")
-            logger.info(f"Split count: {verifier.split_count}")
+            logger.info(f"Split count: {len(verifier.bound_tracker['split_history'])}")
     
     # 保存結果（包含所有captured logs）
     save_verification_results(json_file, txt_file, log_capture.captured_logs, args, results_data, session_dir)
