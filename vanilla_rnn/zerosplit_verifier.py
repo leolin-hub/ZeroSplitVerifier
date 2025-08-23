@@ -1558,7 +1558,7 @@ def main():
         
         X, y, target_label = sample_mnist_data(
             N=N, seq_len=time_step, device=device,
-            data_dir='../data/mnist', train=False, shuffle=True, rnn=verifier
+            data_dir='./data/mnist', train=False, shuffle=True, rnn=verifier
         )
         torch.set_printoptions(
             threshold=float('inf'),  # 顯示所有元素
