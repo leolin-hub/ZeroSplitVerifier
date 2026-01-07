@@ -2047,24 +2047,6 @@ def main():
             train=False,
             rnn=verifier  # 篩選預測正確的樣本
         )
-        # torch.set_printoptions(
-        #     threshold=float('inf'),  # 顯示所有元素
-        #     linewidth=200,          # 每行字符數
-        #     edgeitems=10           # 邊緣顯示的元素數
-        # )
-        # print(f"{X[0]}")
-        # X_train, y_train, target_train_label, _, _, _  = prepare_stock_tensors_split(
-        #     csv_path='C:/Users/zxczx/POPQORN/vanilla_rnn/utils/A1_bin.csv',
-        #     window_size=time_step,
-        #     train_ratio=0.8,
-        #     device=device
-        # )
-        # # 只取前N個樣本(到target_label是新資料)
-        # X = X_train[:N]
-        # y = y_train[:N]
-        # target_label = target_train_label[:N]
-        # print(f"Sampled {N} data points with shape: {X.shape}")
-        # print(f"X: {X}")
         
         verifier.extractWeight(clear_original_model=False)
 
