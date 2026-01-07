@@ -4,3 +4,5 @@ __pycache__/
 .vscode/
 data/
 *verification_results/
+auto_test_results_*/
+shap_test_output/
