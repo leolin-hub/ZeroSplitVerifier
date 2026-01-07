@@ -104,7 +104,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description = 'Train Mnist RNN Classifier')
 
-    parser.add_argument('--hidden-size', default = 64, type = int, metavar = 'HS',
+    parser.add_argument('--hidden-size', default = 32, type = int, metavar = 'HS',
                         help = 'hidden layer size (default: 64)')
     parser.add_argument('--time-step', default = 7, type = int, metavar = 'TS',
                         help = 'number of slices to cut the 28*28 image into, it should be a factor of 28 (default: 7)')

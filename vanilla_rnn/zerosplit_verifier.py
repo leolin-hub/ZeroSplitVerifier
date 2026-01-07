@@ -8,14 +8,22 @@ from loguru import logger
 import json
 import sys
 from datetime import datetime
-import io
-from contextlib import redirect_stdout, redirect_stderr
+from collections import Counter
+from pathlib import Path
+import time
+
+import multiprocessing as mp
+from functools import partial
 
 import torch
 from torchvision import datasets, transforms
 from utils.sample_data import sample_mnist_data
 from utils.sample_stock_data import prepare_stock_tensors_split
+from utils.sample_seq_mnist import sample_seq_mnist_data
+from utils.sample_cifar10 import sample_cifar10_data
+
 import get_bound_for_general_activation_function as get_bound
+from locate_timestep_shap import compute_shap_ranking_once, select_timestep_from_shap
 
 class LoggerCapture:
     """捕獲logger輸出的類"""
@@ -33,14 +41,15 @@ class LoggerCapture:
 def setup_result_logging(work_dir, eps_value, args):
     """設置結果保存的資料夾結構和logger捕獲"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dataset_name = Path(args.work_dir).parent.name.split('_classifier')[0]
     
     # 建立時間子資料夾 - 在當前目錄(vanilla_rnn)下建立verification_results
     current_dir = os.path.dirname(os.path.abspath(__file__))  # vanilla_rnn目錄
-    session_dir = os.path.join(current_dir, "verification_results", f"session_{timestamp}")
+    session_dir = os.path.join(current_dir, "verification_results", f"session_{dataset_name}_{args.mode}_{args.activation}_{args.time_step}_{args.hidden_size}_eps{eps_value}_N{args.N}_p{args.p}")
     os.makedirs(session_dir, exist_ok=True)
     
     # 建立本次實驗的檔案名稱
-    base_name = f"zerosplit_eps{eps_value}_N{args.N}_maxsplit{args.max_splits}"
+    base_name = f"zerosplit__{dataset_name}_{args.mode}_{args.activation}_timestep{args.time_step}_hidden{args.hidden_size}_eps{eps_value}_N{args.N}_maxsplit{args.max_splits}"
     json_file = os.path.join(session_dir, f"{base_name}.json")
     txt_file = os.path.join(session_dir, f"{base_name}.txt")
     
@@ -52,81 +61,26 @@ def setup_result_logging(work_dir, eps_value, args):
     
     return json_file, txt_file, log_capture, session_dir
 
-def extract_bounds_analysis_info(captured_logs):
-    """從捕獲的logs中提取bounds analysis資訊"""
-    bounds_analyses = []
-    final_report = {}
+def serialize_split_tree(tree_node):
+    if tree_node is None:
+        return None
     
-    current_analysis = None
-    in_final_report = False
+    serialized = {}
+    for key, value in tree_node.items():
+        if key in ['pos_bounds', 'neg_bounds', 'path']:
+            # Skip torch tensors and redundant fields
+            continue
+        elif key in ['pos_subtree', 'neg_subtree']:
+            # Recursively process subtrees
+            serialized[key] = serialize_split_tree(value)
+        else:
+            # Other fields are copied directly
+            serialized[key] = value
     
-    for log_entry in captured_logs:
-        message = log_entry['message']
-        
-        # 檢測bounds analysis開始
-        if "Bounds Analysis" in message and "---" in message:
-            if current_analysis:
-                bounds_analyses.append(current_analysis)
-            
-            stage_name = message.split("---")[1].strip().split(" ")[0]  # 提取stage名稱
-            current_analysis = {
-                'stage': stage_name,
-                'timestamp': log_entry['timestamp'],
-                'metrics': {}
-            }
-            
-        # 檢測final report開始
-        elif "FINAL BOUNDS IMPROVEMENT REPORT" in message:
-            in_final_report = True
-            final_report['start_timestamp'] = log_entry['timestamp']
-            final_report['content'] = []
-            
-        # 收集當前analysis的指標
-        elif current_analysis and any(keyword in message for keyword in [
-            "Samples with bound improvement:",
-            "Average bounds improvement:",
-            "Potential false positive samples:",
-            "Original safe samples:",
-            "Unsafe samples before split:",
-            "Safe samples after split:",
-            "Unsafe samples to safe after split:",
-            "Current stage verification rate:"
-        ]):
-            # 解析指標
-            for keyword in ["Samples with bound improvement:", "Average bounds improvement:", 
-                          "Potential false positive samples:", "Original safe samples:",
-                          "Unsafe samples before split:", "Safe samples after split:",
-                          "Unsafe samples to safe after split:", "Current stage verification rate:"]:
-                if keyword in message:
-                    value = message.split(keyword)[1].strip()
-                    metric_key = keyword.replace(":", "").replace(" ", "_").lower()
-                    current_analysis['metrics'][metric_key] = value
-                    break
-        
-        # 收集final report內容 - 擴展關鍵字匹配
-        elif in_final_report and any(keyword in message for keyword in [
-            "指標", "Gap Reduction", "Improvement Sources", "Status Change", 
-            "├─", "│", "└─", "總體效能評估", "⚠️", "RISK ASSESSMENT",
-            "Samples with", "Average", "Maximum", "contribution", "effectiveness",
-            "Safe samples", "Unsafe samples", "conversions", "success rate",
-            "Overall", "enhancement", "suppression", "reduction"
-        ]):
-            final_report['content'].append({
-                'timestamp': log_entry['timestamp'],
-                'message': message
-            })
-    
-    # 添加最後一個analysis
-    if current_analysis:
-        bounds_analyses.append(current_analysis)
-    
-    return bounds_analyses, final_report
+    return serialized
 
-def save_verification_results(json_file, txt_file, captured_logs, args, results_data, session_dir):
+def save_verification_results(json_file, txt_file, captured_logs, args, results_data, session_dir, verifier):
     """保存驗證結果，重點保存logger分析資訊"""
-    
-    # 提取bounds analysis和final report資訊
-    bounds_analyses, final_report = extract_bounds_analysis_info(captured_logs)
     
     # 準備保存的數據
     save_data = {
@@ -141,12 +95,32 @@ def save_verification_results(json_file, txt_file, captured_logs, args, results_
             'eps': args.eps,
             'p_norm': args.p,
             'N_samples': args.N,
-            'max_splits': args.max_splits
+            'max_splits': args.max_splits,
+            'mode': args.mode,
         },
         'verification_results': results_data,
-        'bounds_analysis': bounds_analyses,
-        'final_report': final_report,
-        'all_logs': [log for log in captured_logs]  # 保留完整log以備查
+        
+        # 改用 sample_records（新增）
+        'sample_records': [
+            {
+                'sample_id': r['sample_id'],
+                'popqorn_verified': r.get('popqorn_verified', None),
+                'is_verified': r['is_verified'],
+                'total_splits': r['total_splits'],
+                'num_leaves': r['num_leaves'],
+                'all_leaves_verified': r['all_leaves_verified'],
+                'improvements': r.get('improvements'),
+                'split_timesteps': r.get('split_timesteps', []),  # 新增
+                'pq_failed_zs_success': r.get('pq_failed_zs_success', False),  # 新增
+                'shap_values': r.get('shap_vals', None),  # 新增
+                'split_times': r.get('split_times', []),
+                'split_tree_summary': serialize_split_tree(r.get('split_tree'))
+                # split_tree 和 bounds 太大，可選擇性保存
+            }
+            for r in getattr(verifier, 'sample_records', [])
+        ] if hasattr(verifier, 'sample_records') else [],
+        
+        'all_logs': [log for log in captured_logs]
     }
     
     # 保存JSON
@@ -161,61 +135,16 @@ def save_verification_results(json_file, txt_file, captured_logs, args, results_
         f.write(f"Timestamp: {save_data['experiment_info']['timestamp']}\n")
         f.write(f"Model: {args.work_dir}\n")
         f.write(f"Parameters: hidden_size={args.hidden_size}, time_step={args.time_step}, activation={args.activation}\n")
-        f.write(f"Test config: eps={args.eps}, p={args.p}, N={args.N}, max_splits={args.max_splits}\n\n")
+        f.write(f"Test config: eps={args.eps}, p={args.p}, N={args.N}, max_splits={args.max_splits}, mode={args.mode}\n\n")
         
-        # 基本驗證結果
-        f.write(f"Basic Verification Results:\n")
-        f.write(f"{'-'*40}\n")
-        f.write(f"Final verification: {'SUCCESS' if results_data['is_verified'] else 'FAILED'}\n")
-        f.write(f"Total split count: {results_data['split_count']}\n")
-        f.write(f"Predicted class: {results_data['top1_class']}\n")
-        if not results_data['is_verified'] and results_data['unsafe_layer']:
-            f.write(f"Unsafe layer: {results_data['unsafe_layer']}\n")
-        f.write(f"\n")
-        
-        # Bounds Analysis摘要
-        f.write(f"Bounds Analysis Summary:\n")
-        f.write(f"{'-'*40}\n")
-        for i, analysis in enumerate(bounds_analyses):
-            f.write(f"Stage {i+1} - {analysis['stage']}:\n")
-            for metric, value in analysis['metrics'].items():
-                f.write(f"  {metric.replace('_', ' ').title()}: {value}\n")
-            f.write(f"\n")
-        
-        # Final Report摘要 - 顯示更多詳細指標
-        if final_report and 'content' in final_report:
-            f.write(f"Final Report Detailed Metrics:\n")
+        # Sample-level 結果
+        if save_data['sample_records']:
+            f.write(f"Sample-Level Results:\n")
             f.write(f"{'-'*40}\n")
-            
-            # 按指標分組顯示
-            current_metric = None
-            for entry in final_report['content']:
-                message = entry['message']
-                
-                # 檢測指標標題
-                if "指標一" in message or "Gap Reduction" in message:
-                    current_metric = "Gap Reduction"
-                    f.write(f"\n{current_metric}:\n")
-                elif "指標二" in message or "Improvement Sources" in message:
-                    current_metric = "Improvement Sources"  
-                    f.write(f"\n{current_metric}:\n")
-                elif "指標三" in message or "Status Change" in message:
-                    current_metric = "Status Change"
-                    f.write(f"\n{current_metric}:\n")
-                elif "總體效能評估" in message:
-                    current_metric = "Overall Performance"
-                    f.write(f"\n{current_metric}:\n")
-                elif "RISK ASSESSMENT" in message:
-                    current_metric = "Risk Assessment"
-                    f.write(f"\n{current_metric}:\n")
-                
-                # 顯示詳細數據（去掉樹狀符號以便閱讀）
-                if any(symbol in message for symbol in ["├─", "│", "└─"]):
-                    clean_message = message.replace("├─", "").replace("│", "").replace("└─", "").strip()
-                    if clean_message and "===" not in clean_message:
-                        f.write(f"  {clean_message}\n")
-                elif "⚠️" in message or "These samples changed" in message:
-                    f.write(f"  {message}\n")
+            verified_count = sum(1 for r in save_data['sample_records'] if r['is_verified'])
+            f.write(f"Verified samples: {verified_count}/{len(save_data['sample_records'])}\n")
+            f.write(f"Average splits: {sum(r['total_splits'] for r in save_data['sample_records']) / len(save_data['sample_records']):.2f}\n")
+        
 
 class ZeroSplitVerifier(RNN):
     def __init__(self, input_size, hidden_size, output_size, time_step, activation, max_splits=1, debug=False):
@@ -229,8 +158,13 @@ class ZeroSplitVerifier(RNN):
             'split_history': [],
             'current_split_count': 0,
         }
+        self.split_history = {}
+        self.pgd_config = {'u1': 10, 'u2': 20, 'step_size': 0.01, 'x_min': -1, 'x_max': 1}
+        # 保存原始POPQORN的l, u
+        self.original_l = None
+        self.original_u = None
         
-    def _compute_basic_bounds(self, eps, p, v, X, N, s, n, idx_eps, return_for_split=False):
+    def _compute_basic_bounds(self, eps, p, v, X, N, s, n, idx_eps):
         """計算當前timestep input的bounds
         
         Args:
@@ -273,17 +207,19 @@ class ZeroSplitVerifier(RNN):
                 # eps is a number
                 yU = yU + idx_eps[v-1] * eps * torch.norm(W_ax, p=q, dim=2)
                 yL = yL - idx_eps[v-1] * eps * torch.norm(W_ax, p=q, dim=2)
-            print(f"Norm: {torch.norm(W_ax, p=q, dim=2)}")
+            # torch.set_printoptions(
+            #     threshold=float('inf'),  # 顯示所有元素
+            #     linewidth=200,          # 每行字符數
+            #     edgeitems=10           # 邊緣顯示的元素數
+            # )
+            # print(f"Wax: {W_ax}")
+            # print(f"Norm: {torch.norm(W_ax, p=q, dim=2)}")
                 
             # 第二項: A^{<v>} W_ax x^{<v>} and Ou^{<v>} W_ax x^{<v>}
             if v == 1:
                 X = X.view(N, 1, n)  # 確保維度正確           
             yU = yU + torch.matmul(W_ax, X[:, v-1, :].view(N, n, 1)).squeeze(2)  # [N, s]
             yL = yL + torch.matmul(W_ax, X[:, v-1, :].view(N, n, 1)).squeeze(2)  # [N, s]
-
-            if return_for_split:
-                input_yL = yL.clone().detach()
-                input_yU = yU.clone().detach()
             
             # 第三項: A^{<v>} (b_a + Delta^{<v>}) and Ou^ {<v>} (b_a + Theta^{<v>})
             yU = yU + b_aa + b_ax  # [N, s]
@@ -294,10 +230,7 @@ class ZeroSplitVerifier(RNN):
                 print(f"Current Timestep {v} input lower: {yL}")
                 print(f"Current Timestep {v} input upper: {yU}")
             
-            if return_for_split:
-                return yU, yL, input_yU, input_yL
-            else:
-                return yU, yL
+            return yU, yL
         
     def computePreactivationBounds(self, eps, p, X = None, Eps_idx = None, unsafe_layer=None, merge_results=True, cross_zero=None):
         """計算hidden layer的preactivation bounds"""
@@ -334,7 +267,7 @@ class ZeroSplitVerifier(RNN):
         
     def compute2sideBound(self, eps, p, v, X = None, Eps_idx = None, unsafe_layer=None,
                            merge_results=True, split_done=False, cross_zero=None,
-                           return_refine_inputs=False, refine_preh=None):
+                           return_refine_preact=False, refine_preh=None):
 
         # 用自定義pre-activation bounds因應有refine，否則就是current self.l/u
         if refine_preh is not None:
@@ -368,14 +301,8 @@ class ZeroSplitVerifier(RNN):
             W_aa = self.W_aa.unsqueeze(0).expand(N,-1,-1)  # [N, s, s]    
             b_ax = self.b_ax.unsqueeze(0).expand(N,-1)  # [N, s]
             b_aa = self.b_aa.unsqueeze(0).expand(N,-1)  # [N, s]
-           
             # v-th terms基本計算
-            if unsafe_layer == v and not split_done:
-                yU, yL, input_yU, input_yL = self._compute_basic_bounds(eps, p, v, X, N, s, n, idx_eps, return_for_split=True)
-                self.input_yL = input_yL
-                self.input_yU = input_yU
-            else:
-                yU, yL = self._compute_basic_bounds(eps, p, v, X, N, s, n, idx_eps)
+            yU, yL = self._compute_basic_bounds(eps, p, v, X, N, s, n, idx_eps)
             
             if not (v == 1):
                 self.split_count = 0
@@ -408,6 +335,7 @@ class ZeroSplitVerifier(RNN):
             self.l[v] = yL
             self.u[v] = yU
             if refine_preh is not None:
+                # 逐步運用先前refineh來更新後面timestep的hidden state
                 refine_preh_l[v] = yL.clone().detach()
                 refine_preh_u[v] = yU.clone().detach()
 
@@ -415,7 +343,7 @@ class ZeroSplitVerifier(RNN):
             if unsafe_layer == v and not split_done:
                 if not merge_results:
                     # 不合併結果，分別計算兩個子問題
-                    result = self._split_and_compute_separate(eps, p, v, Eps_idx, cross_zero, return_refine_inputs)
+                    result = self._split_and_compute_separate(eps, p, v, Eps_idx, cross_zero, return_refine_preact)
                     
                     return result
                 else:
@@ -423,54 +351,14 @@ class ZeroSplitVerifier(RNN):
                     return self._split_and_merge(eps, p, v, Eps_idx, cross_zero)
 
             return yL, yU
-        
-    def adjust_eps_input_for_split(self, cur_v_input_l, cur_v_input_u, original_X, eps, v, p):
 
-        # 取當前input bounds的中點
-        mid = (cur_v_input_l + cur_v_input_u) / 2  # [N, hidden_size]
-
-        # 計算正負區間的中心點，用於更新input
-        neg_center = (cur_v_input_l + mid) / 2
-        pos_center = (cur_v_input_u + mid) / 2
-        
-        # 用原始W_ax計算pseudo inverse
-        W_ax_pinv = torch.pinverse(self.W_ax)  # [input_size, hidden_size]
-        
-        X_pos = original_X.clone().detach()  # [N, timestep, input_size]
-        X_neg = original_X.clone().detach()
-        
-        # 只更新第v-1個時間步
-        # neg_center: [N, hidden_size] @ W_ax_pinv.t(): [hidden_size, input_size] = [N, input_size]
-        X_neg[:, v-1, :] = torch.matmul(neg_center, W_ax_pinv.t())
-        X_pos[:, v-1, :] = torch.matmul(pos_center, W_ax_pinv.t())
-        
-        # pos and neg epsilon計算
-        half_width = torch.abs(cur_v_input_u - pos_center) # (eps * ||W_ax||_q) / 2
-
-        if p == 1:
-            q = float('inf')
-        elif p == float('inf'):
-            q = 1
-        else:
-            q = p / (p-1)
-
-        W_ax_norm = torch.norm(self.W_ax, p=q, dim=1)  # [hidden_size]
-        W_ax_norm_inv = torch.reciprocal(W_ax_norm + 1e-8)  # [hidden_size]
-        eps = (half_width * W_ax_norm_inv)[:, 0]  # [N, 1] -> [N]
-        print(f"eps shape: {eps.shape}, eps: {eps}")
-            
-        return X_pos, X_neg, eps, eps
-
-    def _split_and_compute_separate(self, eps, p, v, Eps_idx, cross_zero=None, return_refine_inputs=False):
+    def _split_and_compute_separate(self, eps, p, v, Eps_idx, cross_zero=None, return_refine_preact=False):
         """分割當前層並分別計算兩個子問題"""
         # 保存原始bounds
         orig_l = self.l[v].clone().detach()
         orig_u = self.u[v].clone().detach()
         full_X = self.original_X.clone().detach()
         # print(f"full_X shape: {full_X.shape}")
-
-        cur_v_input_l = self.input_yL
-        cur_v_input_u = self.input_yU
         
         if self.debug:
             print(f"Splitting layer {v}, cross_zero count: {cross_zero.sum().item()}")
@@ -484,12 +372,6 @@ class ZeroSplitVerifier(RNN):
         pos_u = orig_u.clone().detach()
         pos_l[cross_zero] = 0
 
-        # 得到正負區間新的input和epsilon
-        X_pos, X_neg, eps_pos, eps_neg = self.adjust_eps_input_for_split(cur_v_input_l, cur_v_input_u, full_X, eps,  v, p)
-        # print(f"X_pos shape: {X_pos.shape}")
-        # self.l[v] = pos_l
-        # self.u[v] = pos_u
-
         # 計算正區間 - 創建正區間的pre-activation bounds
         pos_l_state = [bound.clone() if bound is not None else None for bound in self.l]
         pos_l_state[v] = pos_l
@@ -501,14 +383,14 @@ class ZeroSplitVerifier(RNN):
             # 從v+1層開始計算到最後一個隱藏層
             for k in range(v+1, self.time_step+1):
                 pos_yL, pos_yU = self.compute2sideBound(
-                    eps_pos, p, k, X=X_pos[:, 0:k, :], Eps_idx=Eps_idx,
+                    eps, p, k, X=full_X[:, 0:k, :], Eps_idx=Eps_idx,
                     refine_preh=(pos_l_state, pos_u_state)
-                ) # eps換成eps_pos
+                )
                 # print(f"第 {k} timestep的pre-activation bounds: 正區間下界: {pos_yL}, 正區間上界: {pos_yU}")
             
             # 計算輸出層
             pos_yL, pos_yU = self.computeLast2sideBound(
-                eps_pos, p, v=self.time_step+1, X=X_pos, Eps_idx=Eps_idx
+                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
             )
             # print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
             # print(f"正區間的bounds差異: {pos_yU - pos_yL}")
@@ -525,7 +407,7 @@ class ZeroSplitVerifier(RNN):
 
             # v已經是最後一個隱藏層，直接計算輸出層
             pos_yL, pos_yU = self.computeLast2sideBound(
-                eps_pos, p, v=self.time_step+1, X=X_pos, Eps_idx=Eps_idx
+                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
             )
             # print(f"正區間的final bounds: {pos_yL}, {pos_yU}")
             # print(f"正區間的bounds差異: {pos_yU - pos_yL}")
@@ -549,14 +431,14 @@ class ZeroSplitVerifier(RNN):
             # 從v+1層開始計算到最後一個隱藏層
             for k in range(v+1, self.time_step+1):
                 neg_yL, neg_yU = self.compute2sideBound(
-                    eps_neg, p, k, X=X_neg[:, 0:k, :], Eps_idx=Eps_idx,
+                    eps, p, k, X=full_X[:, 0:k, :], Eps_idx=Eps_idx,
                     refine_preh=(neg_l_state, neg_u_state)
                 ) # eps換eps_neg
                 # print(f"第 {k} timestep的pre-activation bounds: 負區間下界: {neg_yL}, 負區間上界: {neg_yU}")
             
             # 計算輸出層
             neg_yL, neg_yU = self.computeLast2sideBound(
-                eps_neg, p, v=self.time_step+1, X=X_neg, Eps_idx=Eps_idx
+                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
             )
             # print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
             # print(f"負區間的bounds差異: {neg_yU - neg_yL}")
@@ -573,7 +455,7 @@ class ZeroSplitVerifier(RNN):
 
             # v已經是最後一個隱藏層，直接計算輸出層
             neg_yL, neg_yU = self.computeLast2sideBound(
-                eps_neg, p, v=self.time_step+1, X=X_neg, Eps_idx=Eps_idx
+                eps, p, v=self.time_step+1, X=full_X, Eps_idx=Eps_idx
             )
             # print(f"負區間的final bounds: {neg_yL}, {neg_yU}")
             # print(f"負區間的bounds差異: {neg_yU - neg_yL}")
@@ -583,10 +465,10 @@ class ZeroSplitVerifier(RNN):
         # self.u[v] = orig_u
         
         # 返回兩個子問題的最終結果
-        if return_refine_inputs:
+        if return_refine_preact:
             return (pos_yL, pos_yU), (neg_yL, neg_yU), \
-                   (X_pos, eps_pos, (pos_l_state, pos_u_state)), \
-                   (X_neg, eps_neg, (neg_l_state, neg_u_state))
+                   ((pos_l_state, pos_u_state)), \
+                   ((neg_l_state, neg_u_state))
         else:
             return (pos_yL, pos_yU), (neg_yL, neg_yU)
 
@@ -596,17 +478,9 @@ class ZeroSplitVerifier(RNN):
         (pos_yL, pos_yU), (neg_yL, neg_yU) = self._split_and_compute_separate(
             eps, p, v, Eps_idx, cross_zero=cross_zero
         )
-        
-        # 計算每個區間的bounds width
-        pos_width = pos_yU - pos_yL  # [N, output_size]
-        neg_width = neg_yU - neg_yL  # [N, output_size]
-        
-        # Element-wise選擇更鬆的區間(worst case)
-        pos_worse = pos_width >= neg_width  # [N, output_size]
-        
-        # 創建合併結果
-        yL = torch.where(pos_worse, pos_yL, neg_yL)
-        yU = torch.where(pos_worse, pos_yU, neg_yU)
+
+        yL = torch.minimum(pos_yL, neg_yL)
+        yU = torch.maximum(pos_yU, neg_yU)
 
         print(f"Merged bounds: {yL}, {yU}")
         print(f"Bounds difference: {yU - yL}")
@@ -842,6 +716,174 @@ class ZeroSplitVerifier(RNN):
         
         # 多返回yL_out和yU_out
         return robust, top1_class, yL_out, yU_out
+    
+    # PGD Validation
+    def pgd_validate_timestep(self, X, timestep, top1_class, eps, p, refine_preh=None):
+        
+        Eps_idx = torch.arange(1, self.time_step + 1)
+
+        if refine_preh is not None:
+            l_state, u_state = refine_preh
+            for i in range(len(l_state)):
+                if l_state[i] is not None:
+                    self.l[i] = l_state[i].clone()
+                if u_state[i] is not None:
+                    self.u[i] = u_state[i].clone()
+
+        worst_violation = 0.0
+        found_counterexample = False
+
+        for _ in range(self.pgd_config['u1']):
+            # Sample v* in l_p ball
+            amid = X[:, timestep-1, :].clone()
+            v_star = self._sample_in_ball(amid, eps, p)
+
+            # u2 iterations: PGD
+            for _ in range(self.pgd_config['u2']):
+                # Gen(v*): 構成完整輸入序列
+                x_adv = X.clone()
+                x_adv[:, timestep-1, :] = v_star
+
+                # 用 verify_robustness 檢查 Post condition
+                if refine_preh is not None:
+                    if timestep < self.time_step:
+                        # 從v+1層開始計算到最後一個隱藏層
+                        for k in range(timestep+1, self.time_step+1):
+                            yL, yU = self.compute2sideBound(
+                                eps, p, k, X=x_adv[:, 0:k, :], Eps_idx=Eps_idx,
+                                refine_preh=(l_state, u_state)
+                            )
+                        
+                        # 計算輸出層
+                        yL_out, yU_out = self.computeLast2sideBound(
+                            eps, p, v=self.time_step+1, X=x_adv, Eps_idx=Eps_idx
+                        )
+                    else:
+                        # v已經是最後一個隱藏層，直接計算輸出層
+                        yL_out, yU_out = self.computeLast2sideBound(
+                            eps, p, v=self.time_step+1, X=x_adv, Eps_idx=Eps_idx
+                        )
+                else:
+                    is_verified, _, yL_out, yU_out = self.verify_robustness(x_adv, eps)
+
+                # 檢查單樣本的驗證狀態 (shape: [1, output_size])
+                other_classes = [j for j in range(self.output_size) if j != top1_class]
+                is_safe = all(yL_out[0, top1_class] > yU_out[0, j] for j in other_classes)
+                # 檢查 Post condition
+                if not is_safe:
+                    # Found counterexample
+                    found_counterexample = True
+                    violation = self.compute_violation_from_bounds(
+                        yL_out, yU_out, torch.tensor([top1_class])
+                    )
+                    worst_violation = max(worst_violation, violation)
+
+                # === 使用 forward pass 的 gradient 引導搜索 ===
+                # 因為 verify_robustness 用 bound propagation 無 gradient
+                # 我們用 forward logit 作為 proxy 來引導方向
+                grad = self.compute_gradient_proxy(x_adv, torch.tensor([top1_class]), timestep)
+
+                # Update v* to maximize violation (gradient ascent)
+                with torch.no_grad():
+                    v_star = v_star + self.pgd_config['step_size'] * torch.sign(grad)
+
+                    # Clip to l_p ball around amid
+                    v_star = self.project_to_ball(v_star, amid, eps, p)
+
+            return found_counterexample, worst_violation
+
+    def _sample_in_ball(self, x_center, eps, p):
+        """Random sample in l_p ball"""
+        x_center = x_center.clone()
+
+        if p == 2:
+            noise = torch.randn_like(x_center)
+            noise = noise / (torch.norm(noise, p=2) + 1e-8)
+            radius = torch.rand(1).item() * eps
+            noise = noise * radius
+        elif p == float('inf'):
+            noise = torch.rand_like(x_center) * 2 - 1  # uniform in [-1, 1]
+            noise = noise * eps
+        elif p == 1:
+            noise = torch.randn_like(x_center)
+            abs_noise = torch.abs(noise)
+            abs_noise = abs_noise / (torch.sum(abs_noise) + 1e-8)
+            signs = torch.sign(noise)
+            noise = signs * abs_noise * torch.rand(1).item() * eps
+
+        v_star = torch.clamp(x_center + noise, self.pgd_config['x_min'], self.pgd_config['x_max'])
+            
+        return v_star
+    
+    def project_to_ball(self, v_star, amid, eps, p):
+        """Project x to l_p ball around x_center"""
+        delta = v_star - amid
+
+        if p == 2:
+            # l_2 projection
+            norm = torch.norm(delta, p=2)
+            if norm > eps:
+                delta = delta / (norm + 1e-8) * eps
+        elif p == float('inf'):
+            # l_∞ projection: clip each dimension
+            delta = torch.clamp(delta, -eps, eps)
+        elif p == 1:
+            # l_1 projection
+            norm = torch.norm(delta, p=1)
+            if norm > eps:
+                # 投影到 l_1 ball 較複雜，使用近似
+                delta = delta / (norm + 1e-8) * eps
+
+        return torch.clamp(amid + delta, self.pgd_config['x_min'], self.pgd_config['x_max'])
+    
+    def compute_violation_from_bounds(self, yL_out, yU_out, target):
+        """
+        從 certified bounds 計算 Post condition violation margin
+        
+        Post condition: yL[target] > yU[other] for all other classes
+        Violation: max_j≠target (yU[j] - yL[target])
+        
+        正值表示有 violation (unsafe)
+        負值表示滿足 Post condition (safe)
+        """
+        target_lower = yL_out[0, target]  # certified lower bound of top1 class
+        
+        # 找所有其他 classes 的 upper bounds
+        other_uppers = torch.cat([
+            yU_out[0, :target],
+            yU_out[0, target+1:]
+        ])
+        max_other_upper = torch.max(other_uppers)
+        
+        # Violation margin (positive = violation, negative = safe)
+        violation = max_other_upper - target_lower
+        return violation.item()
+        
+    def compute_gradient_proxy(self, x_adv, target, timestep):
+        """
+        用 forward pass 的 logits 計算 gradient，作為搜索方向的 proxy
+        因為 verify_robustness 用 bound propagation 無法提供 gradient
+        
+        這是 Algorithm 2 Line 10 的實作:
+        grad = ∂Loss/∂x_i ⊙ ∂Gen/∂v*(v*)
+        
+        在我們的情況，Gen(v*) 就是把 v* 放到 X[:, timestep-1, :]
+        所以 ∂Gen/∂v* = Identity
+        """
+        x_adv_copy = x_adv.clone().detach().requires_grad_(True)
+
+        logits = self.forward(x_adv_copy)
+
+        top1 = target.item() if hasattr(target, 'item') else target
+        other_classes = [j for j in range(logits.shape[1]) if j != top1]
+        max_other_idx = max(other_classes, key=lambda j: logits[0, j].item())
+
+        loss = logits[0, max_other_idx] - logits[0, top1]
+
+        # 計算 gradient
+        grad = torch.autograd.grad(loss, x_adv_copy, create_graph=False)[0]
+
+        return grad[:, timestep-1, :].detach()
 
     def has_violation(self, layer_bounds):
         """檢查當前layer的bound是否有violation
@@ -858,24 +900,85 @@ class ZeroSplitVerifier(RNN):
         # 如果有跨越0，就視為有violation需要split
         return cross_zero.any(), cross_zero
 
-    def locate_unsafe_layer(self, start_timestep=1, refine_preh=None):
-        """用Sequential(原為Binary) search找到第一個出現violation的layer(需要精進)"""
-        
-        # 依序檢查從start_timestep開始的每一層
-        for timestep in range(start_timestep, self.time_step+1):
-            # 如果有提供refine_preh，則使用它來獲取當前layer的bounds
-            # 否則初始使用self.l和self.u
-            if refine_preh is not None:
-                preh_lower = refine_preh[0][timestep]
-                preh_upper = refine_preh[1][timestep]
-                layer_bounds = (preh_lower, preh_upper)
+    def locate_unsafe_layer_pgd(self, X, eps, top1_class, p, start_timestep=1, refine_preh=None, mode: str = 'max_violation'):
+        """
+        用PGD找到violation score最大的layer
+        Args:
+            mode: 'critical' - binary search找第一個critical
+              'max_violation' - 選validation_score最大的
+    
+        Returns:
+            unsafe_timestep, cross_zero, validation_scores
+        """
+        violation_scores = {}
+        is_unsafe = False
+
+        # Binary search
+        start = start_timestep
+        end = self.time_step
+
+        while start < end:
+            mid = (start + end) // 2
+            is_unsafe, violation = self.pgd_validate_timestep(X, mid, top1_class, eps, p, refine_preh)
+            violation_scores[mid] = violation
+
+            if is_unsafe:
+                end = mid
             else:
-                layer_bounds = (self.l[timestep], self.u[timestep])
-            violation, cross_zero = self.has_violation(layer_bounds)
-            if violation:
-                return timestep, cross_zero
+                start = mid + 1
+
+        # 循環結束後，start指向第一個可能unsafe的timestep
+        # 驗證這個候選是否真的unsafe
+        unsafe_timestep = None
+        if start <= self.time_step:
+            # 如果在循環中已經測過start，可以從violation_scores取，不用重測
+            if start not in violation_scores:
+                is_unsafe, violation = self.pgd_validate_timestep(X, start, top1_class, eps, p, refine_preh)
+                violation_scores[start] = violation
+            else:
+                is_unsafe = violation_scores[start] > 0
+            unsafe_timestep = start if is_unsafe else None
+        # unsafe才做以下的mode判斷，否則直接回傳None
+        if is_unsafe is True:
+            if mode == 'critical':
+                final_timestep = unsafe_timestep
+            elif mode == 'max_violation':
+                # Rank all timesteps
+
+                if violation_scores:
+                    final_timestep = max(violation_scores.keys(), key=lambda t: violation_scores[t])
+                    if violation_scores[final_timestep] == 0:
+                        final_timestep = None
+                else:
+                    final_timestep = None
+            elif mode is None:
+                # 沿用原邏輯：從頭開始找第一個 unsafe
+                final_timestep = None
+                for t in range(start_timestep, self.time_step + 1):
+                    is_unsafe, violation = self.pgd_validate_timestep(X, t, top1_class, eps, p)
+                    violation_scores[t] = violation
+                    if is_unsafe:
+                        final_timestep = t
+                        break
+            else:
+                raise ValueError(f"Unknown mode: {mode}")
+        else:
+            final_timestep = None
+
+        if final_timestep is None:
+            return None, None, violation_scores
         
-        return None, None
+        # 獲取 cross_zero
+        if refine_preh is not None:
+            l_unsafe = refine_preh[0][final_timestep]
+            u_unsafe = refine_preh[1][final_timestep]
+        else:
+            l_unsafe = self.original_l[final_timestep]
+            u_unsafe = self.original_u[final_timestep]
+
+        cross_zero = (l_unsafe < 0) & (u_unsafe > 0)
+
+        return final_timestep, cross_zero, violation_scores
 
     def verify_network(self, X, eps, max_splits=None, merge_results=True):
         """整體的驗證流程"""
@@ -975,468 +1078,828 @@ class ZeroSplitVerifier(RNN):
             
             return is_verified, unsafe_layer, top1_class
         
-    def verify_network_recursive(self, X, eps, max_splits=3):
-        self.original_X = X.clone().detach()
+    @staticmethod
+    def _process_single_sample_worker(args):
+        """
+        Worker for parallel processing. Must be static/picklable.
+        Args: (sample_id, X_i, model_state, eps, p, max_splits, mode,
+               input_size, hidden_size, output_size, time_step, activation)
+        """
+        (sample_id, X_i, model_state, eps, p, max_splits, mode,
+         input_size, hidden_size, output_size, time_step, activation) = args
+        
+        shap_vals = None
+        
+        # Create worker verifier instance
+        worker_verifier = ZeroSplitVerifier(
+            input_size, hidden_size, output_size, time_step, activation, max_splits=max_splits, debug=False
+        )
+        worker_verifier.load_state_dict(model_state, strict=False)
+        worker_verifier.extractWeight(clear_original_model=False)
 
-        # 第一次驗證
-        logger.info("=== Bounds Tracking Analysis ===")
-        is_verified, top1_class, yL_out, yU_out = self.verify_robustness(X, eps)
+        # Phase 1: POPQORN
+        is_verified_pq, top1_i, yL_out_i, yU_out_i = worker_verifier.verify_robustness(X_i, eps)
 
-        self.bound_tracker['output_bounds'] = {
-            'yL': yL_out,
-            'yU': yU_out,
-            'verified': is_verified
+        orig_bounds = {
+            'yL': yL_out_i.clone(),
+            'yU': yU_out_i.clone(),
+            'original_l': [b.clone() if b is not None else None for b in worker_verifier.l],
+            'original_u': [b.clone() if b is not None else None for b in worker_verifier.u]
         }
 
-        self.log_bounds_analysis(yL_out, yU_out, top1_class, "Original")
-        if is_verified:
-            logger.info("第一次就驗證成功，無須split")
-            return True, None, top1_class
+        # Phase 2: Refinement
+        if is_verified_pq:
+            # 只處理失敗的樣本
+            logger.info(f"Sample {sample_id+1} already verified by POPQORN, skipping refinement")
+            result = {
+                'sample_id': sample_id,
+                'is_verified': True,
+                'total_splits': 0,
+                'split_tree': None,
+                'all_leaf_bounds': [([], yL_out_i.clone(), yU_out_i.clone())],
+                'popqorn_only': True,
+                'top1_class': top1_i,
+                'first_unsafe_layer': None,
+                'first_unsafe_layer_method': None,
+                'popqorn_verified': is_verified_pq
+            }
+
+            return {
+                'sample_id': sample_id,
+                'result': result,
+                'orig_bounds': orig_bounds,
+                'popqorn_verified': is_verified_pq,
+                'shap_vals': None
+            }
+
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Processing SAMPLE {sample_id+1}")
+        logger.info(f"{'='*80}")
+        logger.info(f"Sample {sample_id+1} failed POPQORN, starting refinement")
+
+        # Compute SHAP ranking for this sample based on mode
+        if mode == 'shap':
+            logger.info(f"Computing SHAP ranking for sample {sample_id+1}...")
+            selected_timesteps, timestep_importance = compute_shap_ranking_once(worker_verifier, X_i, top1_i, eps, p, top_k_ratio=0.2)
+            logger.info(f"SHAP ranking: {[(t, f'{timestep_importance[t]:.4f}') for t in range(1, worker_verifier.time_step+1)]}")
+            logger.info(f"Selected timesteps (top 60%): {selected_timesteps}")
+            shap_vals = {t: round(float(timestep_importance[t]), 6) for t in range(1, worker_verifier.time_step+1)}
+        elif mode.startswith('last_'): # e.g., last_3 取最後 layer
+            # Extract k from last_k
+            n_last = int(mode.split('_')[1])
+            total_timesteps = worker_verifier.time_step
+            selected_timesteps = list(range(total_timesteps - n_last + 1, total_timesteps + 1))
+            logger.info(f"Using last {n_last} timesteps: {selected_timesteps}")
+            shap_vals = None
+        else:
+            selected_timesteps = None
+            shap_vals = None
+            logger.info(f"Using PGD locate method (mode={mode})")
         
-        # 若驗證失敗，找出問題layer並進行split
-        logger.info("第一次驗證失敗，開始split並尋找unsafe layer")
-        is_verified = self._recursive_split_verify(X, eps, top1_class, split_count=0, max_splits=max_splits,
-                                                    start_timestep=1, refine_preh=None)
+        # 設置 worker 的 original bounds（用於 _recursive_split_verify 內部使用）
+        worker_verifier.orig_output_bounds_per_sample = [orig_bounds]
+        worker_verifier.original_l = orig_bounds['original_l']
+        worker_verifier.original_u = orig_bounds['original_u']
+
+        result = worker_verifier._recursive_split_verify(
+            X_i, eps, top1_i, p, split_count=0, max_splits=max_splits,
+            start_timestep=1, refine_preh=None, mode=mode,
+            sample_id=sample_id, path=[],
+            selected_timesteps=selected_timesteps
+        )
+        result['sample_id'] = sample_id
+        result['top1_class'] = top1_i
+        result['popqorn_verified'] = is_verified_pq
+
+        return {
+            'sample_id': sample_id,
+            'result': result,
+            'orig_bounds': orig_bounds,
+            'popqorn_verified': is_verified_pq,
+            'shap_vals': shap_vals
+        }
+
+    def verify_network_recursive(self, X, eps, p, max_splits=3, mode='critical', n_workers=None):
+        """整體的驗證流程，使用recursive split and verify方法"""
+        self.original_X = X.clone().detach()
+        N = X.shape[0]
+
+        self.orig_output_bounds_per_sample = []
+
+        # 初始化記錄所有 split
+        if not hasattr(self, 'sample_records'):
+            self.sample_records = []
+
+        # Determine number of workers
+        if n_workers is None:
+            n_workers = mp.cpu_count()
+
+        logger.info(f"=== Starting Verification with {n_workers} workers ===")
+
+        # Prepare arguments for each sample
+        model_state = self.state_dict()
+        worker_args = [
+            (i, X[i:i+1], model_state, eps, p, max_splits, mode,
+             self.input_size, self.num_neurons, self.output_size, self.time_step, self.activation)
+            for i in range(N)
+        ]
+
+        # Parallel processing using multiprocessing Pool
+        # Phase 1: 每個樣本獨立跑 POPQORN
+        logger.info("=== Phase 1: POPQORN Bounds Computation ===")
         
-        # 輸出最終分析報告
+        if n_workers > 1:
+            with mp.Pool(processes=n_workers) as pool:
+                worker_results = pool.map(self._process_single_sample_worker, worker_args)
+        else:
+            # Serial fallback (for debugging)
+            worker_results = [self._process_single_sample_worker(args) for args in worker_args]
+
+        worker_results = sorted(worker_results, key=lambda x: x['sample_id'])
+
+        # Main Process - Collect results
+        popqorn_safe_count = 0
+        sample_results = []
+
+        for worker_output in worker_results:
+            sample_id = worker_output['sample_id']
+            result = worker_output['result']
+            orig_bounds = worker_output['orig_bounds']
+            result['shap_vals'] = worker_output.get('shap_vals', None)
+            
+            # Save original bounds
+            self.orig_output_bounds_per_sample.append(orig_bounds)
+            sample_results.append(result)
+
+            if worker_output['popqorn_verified']:
+                popqorn_safe_count += 1
+            
+            self.record_sample_split_tree(result)
+
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Parallel processing completed")
+        logger.info(f"POPQORN Summary: {popqorn_safe_count}/{N} samples verified")
+        logger.info(f"{'='*80}")
+
+        # 檢查 early exit case
+        if popqorn_safe_count == N:
+            logger.info("All samples verified by POPQORN, no refinement needed")
+            self.generate_final_report()
+            all_top1 = torch.stack([r['top1_class'] for r in sample_results])
+            return True, None, all_top1, popqorn_safe_count
+        
+        # 輸出最終報告
         self.generate_final_report()
+
+        # 彙總結果
+        all_verified = all(r['is_verified'] for r in sample_results)
+        total_verified = sum(r['is_verified'] for r in sample_results)
+        all_top1 = torch.stack([r['top1_class'] for r in sample_results])
         
-        return is_verified, None, top1_class
-    
-    def _initialize_bounds_tracking(self):
-        """初始化bounds tracking"""
-        self.bound_tracker = {
-            'output_bounds': None,
-            'split_history': [],
-            'current_split_count': 0,
-        }
-    
-    def _recursive_split_verify(self, X, eps, top1_class, split_count, max_splits, start_timestep=1, refine_preh=None):
-        
+        logger.info(f"\n{'='*80}")
+        logger.info("FINAL SUMMARY")
+        logger.info(f"{'='*80}")
+        logger.info(f"Samples verified: {total_verified}/{N}")
+        logger.info(f"Overall verification: {'SUCCESS' if all_verified else 'FAILED'}")
+        return all_verified, None, all_top1, popqorn_safe_count
+
+    def _recursive_split_verify(self, X, eps, top1_class, p, split_count, max_splits, start_timestep=1, refine_preh=None, mode='max_violation',
+                                sample_id=None, path=[], first_unsafe_layer=None, locate_method=None, selected_timesteps=None,
+                                split_history=None, split_times=None):
+        """
+        採用worst case merge驗證
+        流程：不切計算output bounds -> 找unsafe layer -> 切完後先驗證pos/neg -> 至少一個成功則做union output bounds檢查 -> 失敗則對pos/neg區間繼續切
+        """
+        if split_times is None:
+            split_times = []
+        split_start_time = time.time()
+
         self.original_X = X.clone().detach()
+
+        Eps_idx = torch.arange(1, self.time_step + 1)
+
+        if split_history is None:
+            split_history = set()
+
+        if refine_preh is not None:
+            l_state, u_state = refine_preh
+            for i in range(len(l_state)):
+                if l_state[i] is not None:
+                    self.l[i] = l_state[i].clone()
+                if u_state[i] is not None:
+                    self.u[i] = u_state[i].clone()
+
+            if start_timestep < self.time_step:
+                for k in range(start_timestep, self.time_step + 1):
+                    yL, yU = self.compute2sideBound(
+                        eps, p, k, X=X[:, 0:k, :], Eps_idx=Eps_idx,
+                        refine_preh=(l_state, u_state)
+                    )
+
+            yL_out, yU_out = self.computeLast2sideBound(
+                eps, p, v=self.time_step+1, X=X, Eps_idx=Eps_idx
+            )
+
+        else:
+            _, _, yL_out, yU_out = self.verify_robustness(X, eps)
+
+        current_verified = self._check_region_robust(yL_out, yU_out, top1_class)
+
+        if current_verified:
+            # 當前region驗證成功 -> 這是一個verified leaf node
+            split_elapsed = time.time() - split_start_time
+            split_times.append((split_count, split_elapsed))
+
+            logger.info(f"  Sample {sample_id+1}: Current region VERIFIED at split_count={split_count}")
+            return {
+                'sample_id': sample_id,
+                'is_verified': True,
+                'split_tree': None,
+                'all_leaf_bounds': [(path, yL_out.clone(), yU_out.clone())],
+                'total_splits': split_count,
+                'termination_reason': 'verified_without_further_split',
+                'first_unsafe_layer': first_unsafe_layer,
+                'first_unsafe_layer_method': locate_method,
+                'split_timesteps': list(split_history), # new
+                'split_times': split_times, # new
+            }
 
         # 終止條件判斷
         if split_count >= max_splits:
-            logger.info(f"達到最大 split 數{max_splits}次，驗證失敗")
-            return False
+            split_elapsed = time.time() - split_start_time
+            split_times.append((split_count, split_elapsed))
+
+            logger.info(f"  Sample {sample_id+1}: Reached max_splits={max_splits} but NOT verified, FAILED")
+            return {
+                'sample_id': sample_id,
+                'is_verified': False,
+                'split_tree': None,
+                'all_leaf_bounds': [(path, yL_out.clone(), yU_out.clone())],
+                'total_splits': split_count,
+                'termination_reason': 'max_splits_reached',
+                'first_unsafe_layer': first_unsafe_layer,
+                'first_unsafe_layer_method': locate_method,
+                'split_timesteps': list(split_history), # new
+                'split_times': split_times, # new
+            }
         
-        # 每次往後找第一個unsafe layer
-        unsafe_layer, cross_zero = self.locate_unsafe_layer(start_timestep, refine_preh)
+        if (mode == 'shap' or mode.startswith('last_')) and selected_timesteps is not None: # 加入mode = last_方便測試
+            unsafe_layer, cross_zero = select_timestep_from_shap(
+                self, selected_timesteps, start_timestep, refine_preh, split_history, sample_id
+            )
+
+            if split_count == 0 and unsafe_layer is not None:
+                first_unsafe_layer = unsafe_layer
+                locate_method = "shap"
+                logger.info(f"  Sample {sample_id+1}: First unsafe layer (SHAP): t={unsafe_layer}")
+
+            if unsafe_layer is not None:
+                logger.info(f"  Sample {sample_id+1}: SHAP selected t={unsafe_layer} (start_timestep={start_timestep})")
+        else:
+        # X, eps, top1_class, p
+        # 每次用PGD來找
+            unsafe_layer, cross_zero, _ = self.locate_unsafe_layer_pgd(X, eps, top1_class, p, start_timestep, refine_preh, mode)
+        
+        # 另個實驗：看切每個mode第一個timestep或最後一個timestep的效果
+        # unsafe_layer = 2
+        # if refine_preh is not None:
+        #     l_unsafe = refine_preh[0][unsafe_layer]
+        #     u_unsafe = refine_preh[1][unsafe_layer]
+        # else:
+        #     l_unsafe = self.original_l[unsafe_layer]
+        #     u_unsafe = self.original_u[unsafe_layer]
+
+        # cross_zero = (l_unsafe < 0) & (u_unsafe > 0)
+
+            if split_count == 0 and unsafe_layer is not None:
+                first_unsafe_layer = unsafe_layer
+                locate_method = "pgd"
+                logger.info(f"  Sample {sample_id+1}: First unsafe layer selected: {first_unsafe_layer}")
+
         if unsafe_layer is None:
-            logger.info("沒有找到unsafe layer")
-            return True
+            # 驗證失敗但找不到unsafe layer -> 無法繼續切分，這是一個unverified leaf node
+            split_elapsed = time.time() - split_start_time
+            split_times.append((split_count, split_elapsed))
 
-        logger.info(f"Found unsafe layer: Layer {unsafe_layer} with total N * h {cross_zero.sum()} dims crossing zero")
+            logger.info(f"  Sample {sample_id+1}: NOT verified and no unsafe layer found at split_count={split_count}, FAILED")
+            return {
+                'sample_id': sample_id,
+                'is_verified': False,  # RETURN FALSE
+                'split_tree': None,
+                'all_leaf_bounds': [(path, yL_out.clone(), yU_out.clone())],
+                'total_splits': split_count,
+                'termination_reason': 'no_unsafe_layer',
+                'first_unsafe_layer': first_unsafe_layer,
+                'first_unsafe_layer_method': locate_method,
+                'split_timesteps': list(split_history), # new
+                'split_times': split_times, # new
+            }
 
-        # 在unsafe layer split為正負兩區域 (Input取到unsafe_layer，之後會調整X和eps)
-        pos_bounds, neg_bounds, pos_input, neg_input = self.compute2sideBound(
-            eps, p=2, v=unsafe_layer, X=X[:, 0:unsafe_layer, :],
+        logger.info(f"  Sample {sample_id+1}: Found unsafe layer {unsafe_layer}, splitting...")
+        logger.info(f"  Path: {path} -> splitting layer {unsafe_layer}")
+
+        # 在unsafe layer split為正負兩區域 (Input取到unsafe_layer)
+        pos_bounds, neg_bounds, pos_preact, neg_preact = self.compute2sideBound(
+            eps, p=p, v=unsafe_layer, X=X[:, 0:unsafe_layer, :],
             Eps_idx=torch.arange(1, self.time_step + 1),
             unsafe_layer=unsafe_layer, merge_results=False, cross_zero=cross_zero,
-            return_refine_inputs=True, refine_preh=refine_preh
+            return_refine_preact=True, refine_preh=refine_preh
         )
 
         (pos_yL_out, pos_yU_out) = pos_bounds
         (neg_yL_out, neg_yU_out) = neg_bounds
-        (X_pos, eps_pos, pos_bounds_state) = pos_input
-        (X_neg, eps_neg, neg_bounds_state) = neg_input
+        (pos_bounds_state) = pos_preact
+        (neg_bounds_state) = neg_preact
+        # torch.set_printoptions(
+        #     threshold=float('inf'),  # 顯示所有元素
+        #     linewidth=200,          # 每行字符數
+        #     edgeitems=10           # 邊緣顯示的元素數
+        # )
+        # print(f"正區間的preactivation: {pos_bounds_state}")
+        # print(f"負區間的preactivation: {neg_bounds_state}")
 
-        # 新增Union檢查
-        self._check_union_robust(pos_yL_out, pos_yU_out, neg_yL_out, neg_yU_out, top1_class, unsafe_layer)
+        # ==== Process 1: 各自驗證 ====
+        logger.info(f"\n=== Phase 1: Subproblem Verification ===")
 
-        # 紀錄split完的output bounds
-        self.bound_tracker['current_split_count'] = split_count + 1
-        self.record_split_bounds(pos_yL_out, pos_yU_out, neg_yL_out, neg_yU_out, 
-                                    unsafe_layer, top1_class, "Pos_Neg_split")
+        pos_verified = self._check_region_robust(pos_yL_out, pos_yU_out, top1_class)
+        neg_verified = self._check_region_robust(neg_yL_out, neg_yU_out, top1_class)
 
+        logger.info(f"  Split {split_count+1} at layer {unsafe_layer}:")
+        logger.info(f"    Positive region: {'SAFE' if pos_verified else 'UNSAFE'}")
+        logger.info(f"    Negative region: {'SAFE' if neg_verified else 'UNSAFE'}")
+        
+        # 建立目前split節點
+        current_split = {
+            'split_count': split_count + 1,
+            'timestep': unsafe_layer,
+            'path': path.copy(),
+            'pos_bounds': (pos_yL_out.clone(), pos_yU_out.clone()),
+            'neg_bounds': (neg_yL_out.clone(), neg_yU_out.clone()),
+            'pos_verified': pos_verified,
+            'neg_verified': neg_verified,
+        }
+
+        if pos_verified and neg_verified:
+            split_elapsed = time.time() - split_start_time
+            split_times.append((split_count + 1, split_elapsed))
+
+            logger.info(f"  Sample {sample_id+1}: Both regions verified, SUCCESS at split {split_count+1}")
+            current_split['both_verified'] = True
+            current_split['is_leaf'] = True
+
+            return {
+                'sample_id': sample_id,
+                'is_verified': True,
+                'split_tree': current_split,
+                'all_leaf_bounds': [
+                    (path + [(unsafe_layer, 'pos')], pos_yL_out.clone(), pos_yU_out.clone()),
+                    (path + [(unsafe_layer, 'neg')], neg_yL_out.clone(), neg_yU_out.clone())
+                ],
+                'total_splits': split_count + 1,
+                'first_unsafe_layer': first_unsafe_layer,
+                'first_unsafe_layer_method': locate_method,
+                'split_timesteps': sorted(list(split_history | {unsafe_layer})), # new
+                'split_times': split_times # new
+            }
+
+        split_elapsed = time.time() - split_start_time
+        split_times.append((split_count + 1, split_elapsed))
+        
+        if mode == 'shap' and unsafe_layer is not None:
+            new_split_history = split_history | {unsafe_layer}
+        else:
+            new_split_history = split_history
+
+        # ==== Process 2: 對子區間進行遞迴切割 ====
+        logger.info(f"  Sample {sample_id+1}: Need further splitting...")
         # 驗證並遞迴正區間
-        pos_verified = self._check_and_recurse(
-        pos_yL_out, pos_yU_out, top1_class, X_pos, eps_pos,
-        split_count, max_splits, unsafe_layer + 1, pos_bounds_state, "Positive"
+        logger.info(f"  Entering positive branch...")
+        pos_result = self._recursive_split_verify(
+            X, eps, top1_class, p, split_count + 1, max_splits,
+            start_timestep=unsafe_layer + 1, refine_preh=pos_bounds_state, mode=mode, 
+            sample_id=sample_id, path=path + [(unsafe_layer, 'pos')],
+            first_unsafe_layer=first_unsafe_layer,
+            locate_method=locate_method,
+            selected_timesteps=selected_timesteps,
+            split_history=new_split_history,
+            split_times=split_times.copy()
         )
 
         # 驗證並遞迴負區間
-        neg_verified = self._check_and_recurse(
-            neg_yL_out, neg_yU_out, top1_class, X_neg, eps_neg,
-            split_count, max_splits, unsafe_layer + 1, neg_bounds_state, "Negative"
-        )   
-
-        success = pos_verified and neg_verified
-        logger.info(f"Split {split_count + 1} results: Positive={pos_verified}, Negative={neg_verified}")
-        return success
-    
-    def _check_and_recurse(self, yL_out, yU_out, top1_class, X, eps, 
-                      split_count, max_splits, next_timestep, refine_preh, region_type):
-        """檢查驗證結果，如果失敗則遞迴分割"""
-        N = yL_out.shape[0]
-        
-        # 檢查是否有任何樣本驗證失敗
-        failed_samples = []
-        for i in range(N):
-            top1 = top1_class[i]
-            other_classes = [j for j in range(self.output_size) if j != top1]
-            
-            # 如果當前樣本驗證失敗，需要進一步分割
-            if not all(yL_out[i, top1] > yU_out[i, j] for j in other_classes):
-                failed_samples.append(i)
-
-        if failed_samples:
-            logger.info(f"Region {region_type}: {len(failed_samples)}個 samples 驗證失敗, 從下一個 timestep {next_timestep}往下尋找切分timestep")
-
-            # 紀錄遞迴前的output bounds
-            # self.record_split_bounds(yL_out, yU_out, None, None, 
-            #                         next_timestep-1, top1_class, f"{region_type}_before_split")
-            
-            return self._recursive_split_verify(
-                X, eps, top1_class, split_count + 1, max_splits,
-                start_timestep=next_timestep, refine_preh=refine_preh
-            )
-
-        # 所有樣本都驗證成功
-        logger.info(f"Region {region_type}: 當前子區間所有樣本驗證成功")
-        return True
-    
-    def _check_union_robust(self, pos_yL, pos_yU, neg_yL, neg_yU, top1_class, unsafe_layer):
-        """檢查union後的驗證結果，檢查refinement方法的正確性"""
-        N = pos_yL.shape[0]
-        results = {
-            'pos_safe_samples': [],
-            'neg_safe_samples': [],
-            'union_unsafe_samples': [],
-            'doubt_samples': [], # 正負區間都安全但union不安全
-            'over_ori_bounds': []
-        }
-
-        original_yL = self.bound_tracker['output_bounds']['yL']
-        original_yU = self.bound_tracker['output_bounds']['yU']
-
-        for i in range(N):
-            top1 = top1_class[i]
-            other_classes = [j for j in range(self.output_size) if j != top1]
-
-            pos_contain = torch.all(pos_yL[i] >= original_yL[i]) and torch.all(pos_yU[i] <= original_yU[i])
-            neg_contain = torch.all(neg_yL[i] >= original_yL[i]) and torch.all(neg_yU[i] <= original_yU[i])
-
-            if not pos_contain or not neg_contain:
-                results['over_ori_bounds'].append(i)
-                logger.warning(f"Sample {i}: bounds containment violated!")
-                logger.warning(f"  Original: yL={original_yL[i]}, yU={original_yU[i]}")
-                logger.warning(f"  Pos: yL={pos_yL[i]}, yU={pos_yU[i]}, contained={pos_contain}")
-                logger.warning(f"  Neg: yL={neg_yL[i]}, yU={neg_yU[i]}, contained={neg_contain}")
-
-            # 檢查各區間驗證結果
-            pos_safe = all(pos_yL[i, top1] > pos_yU[i, j] for j in other_classes)
-            neg_safe = all(neg_yL[i, top1] > neg_yU[i, j] for j in other_classes)
-
-            # 計算union bounds (worst case)
-            union_yL = torch.minimum(pos_yL[i], neg_yL[i])
-            union_yU = torch.maximum(pos_yU[i], neg_yU[i])
-            union_safe = all(union_yL[top1] > union_yU[j] for j in other_classes)
-
-            if pos_safe:
-                results['pos_safe_samples'].append(i)
-            if neg_safe:
-                results['neg_safe_samples'].append(i)
-            if not union_safe:
-                results['union_unsafe_samples'].append(i)
-
-            if pos_safe and neg_safe and not union_safe:
-                results['doubt_samples'].append(i)
-                logger.warning(f"Sample {i+1} at layer {unsafe_layer}: pos=safe, neg=safe, union=unsafe")
-                logger.warning(f"  pos_bounds: yL={pos_yL[i]}, yU={pos_yU[i]}")
-                logger.warning(f"  neg_bounds: yL={neg_yL[i]}, yU={neg_yU[i]}")
-                logger.warning(f"  union_bounds: yL={union_yL}, yU={union_yU}")
-
-        # 統計
-        total_pos_safe = len(results['pos_safe_samples'])
-        total_neg_safe = len(results['neg_safe_samples'])
-        total_union_unsafe = len(results['union_unsafe_samples'])
-        total_doubt = len(results['doubt_samples'])
-
-        logger.info(f"Union verification check at layer {unsafe_layer}:")
-        logger.info(f"  Pos safe: {total_pos_safe}/{N}")
-        logger.info(f"  Neg safe: {total_neg_safe}/{N}")
-        logger.info(f"  Union unsafe: {total_union_unsafe}/{N}")
-        logger.info(f"  Suspicious (pos+neg safe, union unsafe): {total_doubt}/{N}")
-
-        if total_doubt > 0:
-            logger.error(f"Found {total_doubt} doubt samples - refinement method may be incorrect!")
-        return results
-    
-    def record_split_bounds(self, pos_yL_out, pos_yU_out, neg_yL_out, neg_yU_out,
-                            timestep, top1_class, split_type):
-        """紀錄split後的output bounds"""
-        split_record = {
-            'split_count': self.bound_tracker['current_split_count'], # 目前切了幾次
-            'timestep': timestep,
-            'split_type': split_type, # 目前在哪個階段：有分Original, Positive, Negative 以及 Pos_Neg_Split(獲得正負區間的output bounds之後)
-            'pos_output_bounds': {'pos_yL': pos_yL_out.clone(), 'pos_yU': pos_yU_out.clone()}, # 正區間的output bounds
-            'improvements': self.compute_bounds_improve(pos_yL_out, pos_yU_out, top1_class), # List
-        }
-
-        if neg_yL_out is not None and neg_yU_out is not None:
-            split_record['neg_output_bounds'] = {
-                'neg_yL': neg_yL_out.clone(),
-                'neg_yU': neg_yU_out.clone()
-            }
-            split_record['neg_improvements'] = self.compute_bounds_improve(neg_yL_out, neg_yU_out, top1_class)
-
-        self.bound_tracker['split_history'].append(split_record)
-
-        # 即時log當前改進狀況
-        self.log_bounds_analysis(pos_yL_out, pos_yU_out,
-            top1_class, f"Split {self.bound_tracker['current_split_count']}"
+        neg_result = self._recursive_split_verify(
+            X, eps, top1_class, p, split_count + 1, max_splits,
+            start_timestep=unsafe_layer + 1, refine_preh=neg_bounds_state, mode=mode, 
+            sample_id=sample_id, path=path + [(unsafe_layer, 'neg')],
+            first_unsafe_layer=first_unsafe_layer,
+            locate_method=locate_method,
+            selected_timesteps=selected_timesteps,
+            split_history=new_split_history,
+            split_times=split_times.copy()
         )
 
-    def compute_bounds_improve(self, yL_out, yU_out, top1_class):
-        """計算相對於原始output bounds的改進狀況"""
-        if self.bound_tracker['output_bounds'] is None:
-            return {}
+        # 合併子樹結果
+        current_split['pos_subtree'] = pos_result.get('split_tree')
+        current_split['neg_subtree'] = neg_result.get('split_tree')
+        current_split['is_leaf'] = False
+
+        # 收集所有leaf bounds
+        all_leaf_bounds = []
+        all_leaf_bounds.extend(pos_result.get('all_leaf_bounds', []))
+        all_leaf_bounds.extend(neg_result.get('all_leaf_bounds', []))
+
+        # 計算總split數
+        total_splits = max(
+            pos_result.get('total_splits', 0),
+            neg_result.get('total_splits', 0)
+        )
+
+        # 整體驗證結果
+        is_verified = pos_result['is_verified'] and neg_result['is_verified']
+
+        logger.info(f"  Sample {sample_id+1}: Split {split_count+1} results - "
+                    f"pos={'SUCCESS' if pos_result['is_verified'] else 'FAILED'}, "
+                    f"neg={'SUCCESS' if neg_result['is_verified'] else 'FAILED'}")
         
-        original_yL = self.bound_tracker['output_bounds']['yL']
-        original_yU = self.bound_tracker['output_bounds']['yU']
+        # 合併子樹的時間記錄
+        all_split_times = [st for st in split_times]  # 包含當前層
+        all_split_times.extend(pos_result.get('split_times', []))
+        all_split_times.extend(neg_result.get('split_times', []))
 
-        N = yL_out.shape[0]
-        improvements = []
-
-        for i in range(N):
-            top1 = top1_class[i]
-            other_classes = [j for j in range(self.output_size) if j != top1]
-
-            sample_improvement = {
-                'sample_idx': i,
-                'top1_class': top1.item(),
-                'original_safe': all(original_yL[i, top1] > original_yU[i, j] for j in other_classes),
-                'split_safe': all(yL_out[i, top1] > yU_out[i, j] for j in other_classes),
-            }
-
-            # 1.計算安全邊界(Worst-Case Gap Reduction)變化
-            original_margin = original_yL[i, top1] - max([original_yU[i, j] for j in other_classes])
-            current_margin = yL_out[i, top1] - max([yU_out[i, j] for j in other_classes])
-            sample_improvement['margin_improvement'] = (current_margin - original_margin)
-
-            # 2.將Improvements拆成：top1 yL提高量 + 其他class yU降低量
-            original_yL_top1_imp = yL_out[i, top1] - original_yL[i, top1]
-            sample_improvement['top1_yL_improvement'] = original_yL_top1_imp.item()
-            other_class_yU_decrease = [original_yU[i, j] - yU_out[i, j] for j in other_classes]
-            total_other_yU_decrease = sum(other_class_yU_decrease).item()
-            sample_improvement['other_class_yU_decrease'] = total_other_yU_decrease
-
-            improvements.append(sample_improvement)
-
-        return improvements
+        return {
+            'sample_id': sample_id,
+            'is_verified': is_verified,
+            'split_tree': current_split,
+            'all_leaf_bounds': all_leaf_bounds,
+            'total_splits': total_splits,
+            'first_unsafe_layer': first_unsafe_layer,
+            'first_unsafe_layer_method': locate_method,
+            'split_timesteps': sorted(list(split_history | {unsafe_layer})),
+            'split_times': all_split_times
+        }
     
-    def log_bounds_analysis(self, yL_out, yU_out, top1_class, stage_name):
+    def _check_region_robust(self, yL_out, yU_out, top1_class):
+        """
+        檢查單一子問題單一樣本的robustness
+        回傳True代表驗證成功，False代表失敗需要繼續切割
+        """
+        if isinstance(top1_class, torch.Tensor):
+            top1_class = top1_class.item()
 
-        logger.info(f"\n--- {stage_name} Bounds Analysis ---")
+        other_classes = [j for j in range(self.output_size) if j != top1_class]
+        region_safe = all(yL_out[0, top1_class] > yU_out[0, j] for j in other_classes)
 
-        if self.bound_tracker['output_bounds'] is None:
-            logger.info("Recording original bounds as baseline")
+        return region_safe
+    
+    def record_sample_split_tree(self, sample_result):
+        """記錄單個樣本的完整 split tree"""
+        sample_id = sample_result['sample_id']
+        all_leaf_bounds = sample_result.get('all_leaf_bounds', [])
+        top1_class = sample_result.get('top1_class')
+        
+        # 計算 global merged bounds（所有 leaf nodes 的 worst-case union）
+        if all_leaf_bounds:
+            all_yL = torch.stack([bounds[1] for bounds in all_leaf_bounds])  # [num_leaves, 1, output_size]
+            all_yU = torch.stack([bounds[2] for bounds in all_leaf_bounds])
+            
+            global_merge_yL = all_yL.min(dim=0)[0]  # [1, output_size]
+            global_merge_yU = all_yU.max(dim=0)[0]
+        else:
+            global_merge_yL = None
+            global_merge_yU = None
+        
+        # 檢查是否所有 leaf 都驗證成功
+        if all_leaf_bounds and top1_class is not None:
+            all_leaves_verified = all(
+                self._check_region_robust(bounds[1], bounds[2], top1_class)
+                for bounds in all_leaf_bounds
+            )
+        else:
+            # 如果沒有 leaf bounds，檢查是否是 no_refinement 或 popqorn_only 的情況
+            # 這些情況下如果 is_verified=True，則 all_leaves_verified 也應該是 True
+            no_refinement = sample_result.get('no_refinement', False)
+            popqorn_only = sample_result.get('popqorn_only', False)
+            if (no_refinement or popqorn_only) and sample_result['is_verified']:
+                all_leaves_verified = True
+            else:
+                all_leaves_verified = False
+        
+        # 計算改善率（相比 POPQORN）
+        if global_merge_yL is not None and top1_class is not None:
+
+            no_refinement = sample_result.get('no_refinement', False)
+
+            if not no_refinement:
+                # 修改：從 per-sample 的 original bounds 讀取
+                original_yL = self.orig_output_bounds_per_sample[sample_id]['yL']  # [1, output_size]
+                original_yU = self.orig_output_bounds_per_sample[sample_id]['yU']
+                # Only include improvement if refinement was actually performed
+                improvement = self.compute_bounds_improve(
+                    original_yL, original_yU,
+                    global_merge_yL, global_merge_yU,
+                    top1_class
+                )
+            else:
+                improvement = None # No refinement done, so no improvement
+        else:
+            improvement = None
+
+        # whether this sample is changed from unverified to verified
+        pq_failed_zs_success = (
+            sample_result.get('popqorn_verified', True) == False and 
+            sample_result['is_verified'] == True
+        )
+
+        leaf_paths = []
+        if all_leaf_bounds:
+            for leaf in all_leaf_bounds:
+                # leaf[0] 是 path list, e.g., [(3, 'pos'), (5, 'neg')]
+                raw_path = leaf[0] 
+                # 提取 timestep
+                timestep_seq = [step[0] for step in raw_path]
+                leaf_paths.append(timestep_seq)
+        
+        # 找出最長的一條路徑作為代表 (或者你可以選擇存所有路徑)
+        longest_path_seq = max(leaf_paths, key=len) if leaf_paths else []
+        
+        sample_record = {
+            'sample_id': sample_id,
+            'popqorn_verified': sample_result.get('popqorn_verified', None),
+            'is_verified': sample_result['is_verified'],
+            'split_tree': sample_result.get('split_tree'),
+            'all_leaf_bounds': all_leaf_bounds,
+            'num_leaves': len(all_leaf_bounds),
+            'global_merged_bounds': (global_merge_yL, global_merge_yU),
+            'all_leaves_verified': all_leaves_verified,
+            'total_splits': sample_result['total_splits'],
+            'improvements': improvement,
+            'first_unsafe_layer': sample_result.get('first_unsafe_layer'),
+            'first_unsafe_layer_method': sample_result.get('first_unsafe_layer_method'),
+            'no_refinement': sample_result.get('no_refinement', False),
+            'split_timesteps': longest_path_seq,
+            'pq_failed_zs_success': pq_failed_zs_success, # new
+            'shap_vals': sample_result.get('shap_vals', None), # new
+            'split_times': sample_result.get('split_times', [])
+        }
+        
+        if not hasattr(self, 'sample_records'):
+            self.sample_records = []
+        
+        self.sample_records.append(sample_record)
+
+    def compute_bounds_improve(self, orig_yL, orig_yU, split_yL, split_yU, top1_class):
+        """計算相對於原始output bounds的改進狀況"""
+        if isinstance(top1_class, torch.Tensor):
+            top1_class = top1_class.item()
+        
+        other_classes = [j for j in range(self.output_size) if j != top1_class]
+        
+        # 計算原始 worst-case gap
+        orig_gaps = [orig_yL[0, top1_class] - orig_yU[0, j] for j in other_classes]
+        orig_min_gap = min(orig_gaps).item()
+        
+        # 計算 split 後的 worst-case gap
+        split_gaps = [split_yL[0, top1_class] - split_yU[0, j] for j in other_classes]
+        split_min_gap = min(split_gaps).item()
+
+        gap_improvement = split_min_gap - orig_min_gap
+
+        # Top-1 lower bound improvement
+        top1_improvement = (split_yL[0, top1_class] - orig_yL[0, top1_class]).item()
+
+        # Other classes upper bound reduction
+        other_reduction = sum(
+            (orig_yU[0, j] - split_yU[0, j]).item() 
+            for j in other_classes
+        ) / len(other_classes)
+
+        # 檢查是否嚴格縮小
+        strict_tighten = bool(
+            (split_yU <= orig_yU).all().item() and 
+            (split_yL >= orig_yL).all().item()
+        )
+
+        return {
+            'gap_improvement': gap_improvement,
+            'top1_improvement': top1_improvement,
+            'other_reduction': other_reduction,
+            'original_gap': orig_min_gap,
+            'split_gap': split_min_gap,
+            'strict_tighten': strict_tighten
+        }
+    
+    def _log_split_details_recursive(self, tree_node, indent=0):
+        """遞歸輸出每個 split 的詳細信息"""
+        if tree_node is None:
             return
         
-        original_yL = self.bound_tracker['output_bounds']['yL']
-        original_yU = self.bound_tracker['output_bounds']['yU']
-
-        N = yL_out.shape[0]
-        improved_samples = 0 # 改善的sample數量
-        total_improvements = 0 # bound對每個維度的改善總和
-        false_positive_risk = 0 # 原先POPQORN無法驗證但split完之後有驗證成功
-        N_safe_original = 0
-        N_safe_split = 0
-        N_unsafe_original = 0
-        N_unsafe_to_safe = 0
+        prefix = " " * indent
+        timestep = tree_node.get('timestep')
         
-        # 整體的improvements check
-        for i in range(N):
-            imp_check_list = [] # for每個sample裡面的top1 class與其他class的output bounds改善程度
-            top1 = top1_class[i]
-            other_classes = [j for j in range(self.output_size) if j != top1]
-
-            # 未split前的output bounds安全結果
-            original_safe = all(original_yL[i, top1] > original_yU[i, j] for j in other_classes)
-            N_safe_original += int(original_safe)
-            # split後的output bounds安全結果
-            split_safe = all(yL_out[i, top1] > yU_out[i, j] for j in other_classes)
-            N_safe_split += int(split_safe)
-            N_unsafe_original += int(not original_safe)
-            N_unsafe_to_safe += int(split_safe and not original_safe)
-
-            # 檢查改進
-            for j in other_classes:
-                original_violation = original_yU[i, j] - original_yL[i, top1]
-                split_violation = yU_out[i, j] - yL_out[i, top1]
-                improvement = original_violation - split_violation
-                imp_check_list.append(improvement)
-
-            # 全部都是正數代表此sample有改善
-            if all(imp > 1e-6 for imp in imp_check_list):
-                improved_samples += 1
-                total_improvements += sum(imp_check_list)
-
-            # 檢查是否有false positive風險
-            if split_safe and not original_safe:
-                false_positive_risk += 1
-
-        # 統計報告
-        logger.info(f"Samples with bound improvement: {improved_samples}/{N}")
-        if improved_samples > 0:
-            avg_improvement = total_improvements / improved_samples
-            logger.info(f"Average bounds improvement: {avg_improvement:.6f}")
-
-        logger.info(f"Original safe samples: {N_safe_original}/{N}")
-        logger.info(f"Unsafe samples before split: {N_unsafe_original}/{N}")
-        logger.info(f"Safe samples after split: {N_safe_split}/{N}")
-        logger.info(f"Unsafe samples to safe after split: {N_unsafe_to_safe}/{N}")
-
-        logger.info(f"Current stage verification rate: {sum(1 for i in range(N) if all(yL_out[i, top1_class[i]] > yU_out[i, j] for j in range(self.output_size) if j != top1_class[i]))}/{N}")
+        if timestep is not None:
+            logger.info(f"{prefix}Split at timestep {timestep}")
+            
+        # 遞歸子樹
+        if 'pos_subtree' in tree_node and tree_node['pos_subtree']:
+            self._log_split_details_recursive(tree_node['pos_subtree'], indent + 2)
+        
+        if 'neg_subtree' in tree_node and tree_node['neg_subtree']:
+            self._log_split_details_recursive(tree_node['neg_subtree'], indent + 2)
+    
+    def _log_split_tree_recursive(self, tree_node, indent=0):
+        if tree_node is None:
+            return
+        
+        prefix = "  " * indent
+        split_count = tree_node.get('split_count', '?')
+        layer = tree_node.get('layer', '?')
+        
+        logger.info(f"{prefix}Split {split_count} at Layer {layer}")
+        
+        if tree_node.get('is_leaf', False):
+            logger.info(f"{prefix}  [LEAF] Both regions verified")
+        else:
+            # 顯示子樹
+            if 'pos_subtree' in tree_node and tree_node['pos_subtree']:
+                logger.info(f"{prefix}  ├─ Positive branch:")
+                self._log_split_tree_recursive(tree_node['pos_subtree'], indent + 2)
+            
+            if 'neg_subtree' in tree_node and tree_node['neg_subtree']:
+                logger.info(f"{prefix}  └─ Negative branch:")
+                self._log_split_tree_recursive(tree_node['neg_subtree'], indent + 2)
 
     def generate_final_report(self):
         """生成最終的驗證報告"""
         
         logger.info(f"\n{'='*80}")
-        logger.info("FINAL BOUNDS IMPROVEMENT REPORT")
+        logger.info("FINAL VERIFICATION REPORT")
         logger.info(f"{'='*80}")
 
-        if not self.bound_tracker['split_history']:
-            logger.info("No splits were performed")
+        if not hasattr(self, 'sample_records') or not self.sample_records:
+            logger.info("No sample records found.")
             return
         
-        # 總體統計
-        total_splits = len(self.bound_tracker['split_history'])
-        final_split = self.bound_tracker['split_history'][-1]
+        N = len(self.sample_records)
+        verified_count = sum(1 for r in self.sample_records if r['is_verified'])
 
-        logger.info(f"Total splits performed: {total_splits}")
-        logger.info(f"Final split timestep: {final_split['timestep']}")
-
-        # 分析最終改進 - 使用三大指標
-        if 'improvements' in final_split:
-            improvements = final_split['improvements']
-            N = len(improvements)
-
-            # 指標一：最差情況間隙縮減量 (Worst-Case Gap Reduction)
-            worst_gap_improvements = []
-            samples_gap_improved = 0
-            samples_unsafe_to_safe = 0
+        # Differ types of results
+        popqorn_only_count = sum(1 for r in self.sample_records if r.get('popqorn_only', False))
+        no_refinement_count = sum(1 for r in self.sample_records if r.get('no_refinement', False))
+        refined_count = N - popqorn_only_count - no_refinement_count
+        
+        logger.info(f"Total samples: {N}")
+        logger.info(f"Verified samples: {verified_count}/{N} ({verified_count/N*100:.1f}%)")
+        logger.info(f"Failed samples: {N - verified_count}/{N}")
+        logger.info(f"\nRefinement breakdown:")
+        logger.info(f"  POPQORN only: {popqorn_only_count}")
+        logger.info(f"  No refinement (no cross-zero layer): {no_refinement_count}")
+        logger.info(f"  Refined samples: {refined_count}\n")
             
-            # 指標二：改進來源分解 (Decomposition of Improvement Sources)
-            total_top1_yL_improvement = 0
-            total_other_yU_decrease = 0
-            samples_with_top1_improvement = 0
-            samples_with_other_decrease = 0
+        for record in self.sample_records:
+            sample_id = record['sample_id']
+
+            logger.info(f"{'='*80}")
+            logger.info(f"SAMPLE {sample_id + 1}")
+            logger.info(f"{'='*80}")
+            logger.info(f"Verification: {'SUCCESS' if record['is_verified'] else 'FAILED'}")
+            logger.info(f"Total splits performed: {record['total_splits']}")
+            logger.info(f"Number of leaf nodes: {record['num_leaves']}")
+            logger.info(f"All leaves verified: {record['all_leaves_verified']}")
+            if record.get('first_unsafe_layer') is not None:
+                logger.info(f"First unsafe layer selected: {record['first_unsafe_layer']}")
+                if record.get('first_unsafe_layer_method') is not None:
+                    logger.info(f"First unsafe layer method: {record['first_unsafe_layer_method']}")
+
+            if record.get('split_timesteps'):
+                logger.info(f"Split timesteps sequence: {record['split_timesteps']}")
+
+            # 標記樣本類型
+            if record.get('popqorn_only', False):
+                logger.info(f"Sample type: POPQORN only")
+            elif record.get('no_refinement', False):
+                logger.info(f"Sample type: No refinement (no cross-zero layer)")
+            else:
+                logger.info(f"Sample type: Refined")
+
+            # 顯示split_tree
+            # if record['split_tree']:
+            #     logger.info(f"\nSplit Tree Structure:")
+            #     self._log_split_tree_recursive(record['split_tree'], indent=2)
+
+            # 顯示improvements
+            if record['improvements']:
+                imp = record['improvements']
+                logger.info(f"\nImprovements vs POPQORN:")
+                logger.info(f"  Gap improvement: {imp['gap_improvement']:.2f}")
+                logger.info(f"  Original min gap: {imp['original_gap']:.2f}")
+                logger.info(f"  Split min gap: {imp['split_gap']:.2f}")
+                logger.info(f"  Top-1 lower bound +: {imp['top1_improvement']:.2f}")
+                logger.info(f"  Other upper bound -: {imp['other_reduction']:.2f}")
+                logger.info(f"  Strict tighten: {imp['strict_tighten']}")
+
+        
+            logger.info("")  # 空行分隔各 split
+        
+        logger.info(f"{'='*80}\n")
+        logger.info("STATISTICS SUMMARY")
+        logger.info(f"{'='*80}")
+        
+        total_splits = sum(r['total_splits'] for r in self.sample_records)
+        avg_splits = total_splits / N if N > 0 else 0
+        max_splits = max(r['total_splits'] for r in self.sample_records)
+        
+        logger.info(f"Average splits per sample: {avg_splits:.2f}")
+        logger.info(f"Maximum splits: {max_splits}")
+        logger.info(f"Total splits across all samples: {total_splits}")
+
+        # Strict tighten 統計
+        strict_tighten_count = sum(
+            1 for r in self.sample_records 
+            if r['improvements'] and r['improvements']['strict_tighten']
+        )
+        logger.info(f"Samples with strict tighten: {strict_tighten_count}")
+        
+        # Gap improvement 統計
+    
+        failed_improvements = [
+            r['improvements']['gap_improvement'] 
+            for r in self.sample_records 
+            if r['improvements'] and not r['popqorn_verified'] and not r.get('popqorn_only', False) and not r.get('no_refinement', False)
+        ]
+        
+        if failed_improvements:
+            avg_fail_gap = sum(failed_improvements) / len(failed_improvements)
+            logger.info(f"\nAverage top-1 gap improvement (fail): {avg_fail_gap:.2f}")
+            logger.info(f"Samples with top-1 gap improvement (fail): {sum(1 for x in failed_improvements if x > 0)}/{len(failed_improvements)}")
+
+        # Top-1 improvement 統計
+
+        failed_top1_imp = [
+            r['improvements']['top1_improvement'] 
+            for r in self.sample_records 
+            if r['improvements'] and not r['popqorn_verified'] and not r.get('popqorn_only', False) and not r.get('no_refinement', False)
+        ]
+        
+        if failed_top1_imp:
+            avg_fail_top1 = sum(failed_top1_imp) / len(failed_top1_imp)
+            logger.info(f"\nAverage top-1 lower bound improvement (fail, refined only): {avg_fail_top1:.2f}")
+            logger.info(f"Samples with top-1 lower bound improvement (fail, refined only): {sum(1 for x in failed_top1_imp if x > 0)}/{len(failed_top1_imp)}")
+        
+        # Other reduction 統計
+        
+        failed_other_reduc = [
+            r['improvements']['other_reduction'] 
+            for r in self.sample_records 
+            if r['improvements'] and not r['popqorn_verified'] and not r.get('popqorn_only', False) and not r.get('no_refinement', False)
+        ]
+        
+        if failed_other_reduc:
+            avg_fail_other = sum(failed_other_reduc) / len(failed_other_reduc)
+            logger.info(f"\nAverage other upper bound reduction (fail, refined only): {avg_fail_other:.2f}")
+            logger.info(f"Samples with other upper bound reduction (fail, refined only): {sum(1 for x in failed_other_reduc if x > 0)}/{len(failed_other_reduc)}")
+        
+        improved_samples = [
+            r for r in self.sample_records 
+            if r.get('pq_failed_zs_success', False)
+        ]
+        
+        if improved_samples:
+            logger.info(f"\n{'='*80}")
+            logger.info("POPQORN FAILED → ZEROSPLIT SUCCESS SAMPLES (DETAILED)")
+            logger.info(f"{'='*80}")
+            logger.info(f"Total improved samples: {len(improved_samples)}/{len(failed_improvements)}")
             
-            # 指標三：驗證狀態轉變率 (Verification Status Change Rate)
-            N_safe_original = 0
-            N_safe_split = 0
-            N_unsafe_original = 0
-            false_positive_count = 0
+            for record in improved_samples:
+                sample_id = record['sample_id']
+                logger.info(f"\n{'-'*80}")
+                logger.info(f"Sample {sample_id + 1}:")
+                logger.info(f"  Split timesteps: {record.get('split_timesteps', [])}")
+                logger.info(f"  Total splits: {record['total_splits']}")
+                logger.info(f"  Number of leaves: {record['num_leaves']}")
+                
+                # 顯示 improvement
+                if record['improvements']:
+                    imp = record['improvements']
+                    logger.info(f"  Gap improvement: {imp['gap_improvement']:.1f} (from {imp['original_gap']:.1f} to {imp['split_gap']:.1f})")
+                    logger.info(f"  Top-1 improvement: {imp['top1_improvement']:.1f}")
+                    logger.info(f"  Other reduction: {imp['other_reduction']:.1f}")
+                
+                # 從 split_tree 中提取每個 split 的詳細信息
+                if record['split_tree']:
+                    logger.info(f"  Split details:")
+                    self._log_split_details_recursive(record['split_tree'], indent=4)
+                
+                logger.info(f"{'-'*80}")
 
-            for imp in improvements:
-                # 指標一：計算最差情況間隙縮減
-                margin_improvement = imp['margin_improvement'].item()
-                worst_gap_improvements.append(margin_improvement)
-                
-                if margin_improvement > 1e-6:
-                    samples_gap_improved += 1
-                
-                # 指標二：改進來源分解
-                top1_improvement = imp['top1_yL_improvement']
-                other_decrease = imp['other_class_yU_decrease'] 
-                
-                if top1_improvement > 1e-6:
-                    total_top1_yL_improvement += top1_improvement
-                    samples_with_top1_improvement += 1
-                    
-                if other_decrease > 1e-6:
-                    total_other_yU_decrease += other_decrease
-                    samples_with_other_decrease += 1
-                
-                # 指標三：驗證狀態統計
-                original_safe = imp['original_safe']
-                split_safe = imp['split_safe']
-                
-                N_safe_original += int(original_safe)
-                N_safe_split += int(split_safe)
-                N_unsafe_original += int(not original_safe)
-                
-                # 檢查從不安全轉為安全
-                if split_safe and not original_safe:
-                    samples_unsafe_to_safe += 1
-                    
-                # 檢查false positive
-                if split_safe and not original_safe:
-                    false_positive_count += 1
+            all_split_timesteps = []
+            for record in improved_samples:
+                all_split_timesteps.extend(record.get('split_timesteps', []))
 
-            # === 報告三大指標 ===
-            logger.info(f"\n=== 指標一：最差情況間隙縮減量 (Worst-Case Gap Reduction) ===")
-            logger.info(f"  ├─ Samples with gap reduction: {samples_gap_improved}/{N}")
-            if samples_gap_improved > 0:
-                avg_gap_reduction = sum(imp for imp in worst_gap_improvements if imp > 1e-6) / samples_gap_improved
-                max_gap_reduction = max(worst_gap_improvements)
-                logger.info(f"  ├─ Average gap reduction: {avg_gap_reduction:.6f}")
-                logger.info(f"  └─ Maximum gap reduction: {max_gap_reduction:.6f}")
-            else:
-                logger.info(f"  └─ No significant gap reduction achieved")
-
-            logger.info(f"\n=== 指標二：改進來源分解 (Decomposition of Improvement Sources) ===")
-            logger.info(f"  ├─ Top-1 lower bound improvements:")
-            logger.info(f"  │   ├─ Samples improved: {samples_with_top1_improvement}/{N}")
-            if samples_with_top1_improvement > 0:
-                avg_top1_improvement = total_top1_yL_improvement / samples_with_top1_improvement
-                logger.info(f"  │   └─ Average improvement: {avg_top1_improvement:.6f}")
-            else:
-                logger.info(f"  │   └─ Average improvement: 0")
-                
-            logger.info(f"  ├─ Other classes upper bound reductions:")
-            logger.info(f"  │   ├─ Samples improved: {samples_with_other_decrease}/{N}")
-            if samples_with_other_decrease > 0:
-                avg_other_decrease = total_other_yU_decrease / samples_with_other_decrease
-                logger.info(f"  │   └─ Average reduction: {avg_other_decrease:.6f}")
-            else:
-                logger.info(f"  │   └─ Average reduction: 0")
-                
-            # 改進來源比例分析
-            total_improvement_sources = samples_with_top1_improvement + samples_with_other_decrease
-            if total_improvement_sources > 0:
-                top1_contribution_rate = samples_with_top1_improvement / total_improvement_sources * 100
-                other_contribution_rate = samples_with_other_decrease / total_improvement_sources * 100
-                logger.info(f"  └─ Improvement source analysis:")
-                logger.info(f"      ├─ Top-1 enhancement contribution: {top1_contribution_rate:.1f}%")
-                logger.info(f"      └─ Other classes suppression contribution: {other_contribution_rate:.1f}%")
-
-            logger.info(f"\n=== 指標三：驗證狀態轉變率 (Verification Status Change Rate) ===")
-            logger.info(f"  ├─ Original verification status:")
-            logger.info(f"  │   ├─ Safe samples: {N_safe_original}/{N} ({N_safe_original/N*100:.1f}%)")
-            logger.info(f"  │   └─ Unsafe samples: {N_unsafe_original}/{N} ({N_unsafe_original/N*100:.1f}%)")
-            logger.info(f"  ├─ After split verification status:")
-            logger.info(f"  │   └─ Safe samples: {N_safe_split}/{N} ({N_safe_split/N*100:.1f}%)")
-            logger.info(f"  ├─ Verification improvement:")
-            logger.info(f"  │   ├─ Unsafe to safe conversions: {samples_unsafe_to_safe}/{N_unsafe_original}")
-            
-            if N_unsafe_original > 0:
-                success_rate = samples_unsafe_to_safe / N_unsafe_original * 100
-                logger.info(f"  │   └─ Conversion success rate: {success_rate:.1f}%")
-            else:
-                logger.info(f"  │   └─ Conversion success rate: N/A (no unsafe samples initially)")
-                
-            logger.info(f"  └─ Overall improvement rate: {(N_safe_split - N_safe_original)/N*100:.1f}%")
-
-            # === 風險評估 ===
-            if false_positive_count > 0:
-                logger.warning(f"\n⚠️  RISK ASSESSMENT:")
-                logger.warning(f"   └─ Potential false positive samples: {false_positive_count}/{N} ({false_positive_count/N*100:.1f}%)")
-                logger.warning(f"       These samples changed from unsafe to safe - please verify manually!")
-            else:
-                logger.info(f"\n✅ RISK ASSESSMENT: No false positive risks detected")
-
-            # === 總體評估 ===
-            logger.info(f"\n=== 總體效能評估 ===")
-            overall_effectiveness = (samples_gap_improved + samples_unsafe_to_safe) / (2 * N) * 100
-            logger.info(f"  ├─ Gap reduction effectiveness: {samples_gap_improved/N*100:.1f}%")
-            logger.info(f"  ├─ Safety conversion effectiveness: {samples_unsafe_to_safe/N*100:.1f}%")
-            logger.info(f"  └─ Overall refinement effectiveness: {overall_effectiveness:.1f}%")
-
-        else:
-            logger.warning("No improvement data available in final split record")
+            if all_split_timesteps:
+                timestep_counts = Counter(all_split_timesteps)
+                logger.info(f"\nTimestep split distribution (POPQORN FAILED → ZEROSPLIT SUCCESS):")
+                for t in sorted(timestep_counts.keys()):
+                    logger.info(f"  Timestep {t}: {timestep_counts[t]} splits")
+                logger.info(f"  Most critical timesteps: {sorted(timestep_counts.items(), key=lambda x: x[1], reverse=True)[:3]}") 
 
 def create_toy_rnn(verifier):
     with torch.no_grad():
@@ -1511,7 +1974,11 @@ def main():
                         help='enable debug output')
     parser.add_argument('--toy-rnn', action='store_true',
                         help='use toy RNN instead of MNIST model')
-    
+    parser.add_argument('--mode', default='critical', type=str, metavar='A',
+                        help='verification mode: critical or max_violation (default: critical)')
+    parser.add_argument('--n-workers', default=None, type=int,
+                        help='number of parallel workers (default: cpu count)')
+
     args = parser.parse_args()
 
     if torch.cuda.is_available() and args.cuda:
@@ -1524,6 +1991,7 @@ def main():
     if p > 100:
         p = float('inf')
     eps = args.eps
+    mode = args.mode
     
     if args.toy_rnn:
         print("=== Toy RNN ===")
@@ -1542,8 +2010,9 @@ def main():
         ], dtype=torch.float32).to(device)
 
     else:
-        input_size = int(28*28 / args.time_step)
-        # input_size = 1
+        # input_size = int(28*28 / args.time_step)
+        input_size = int(32 * 32 * 3 / args.time_step)
+        # input_size = 3
         hidden_size = args.hidden_size
         output_size = 10
         # output_size = 3
@@ -1555,17 +2024,35 @@ def main():
         model_file = os.path.join(args.work_dir, args.model_name)
         verifier.load_state_dict(torch.load(model_file, map_location='cpu'))
         verifier.to(device)
-        
-        X, y, target_label = sample_mnist_data(
-            N=N, seq_len=time_step, device=device,
-            data_dir='../data/mnist', train=False, shuffle=True, rnn=verifier
+        # MNIST
+        # X, y, target_label = sample_mnist_data(
+        #     N=N, seq_len=time_step, device=device,
+        #     data_dir='../data/mnist', train=False, shuffle=True, rnn=verifier
+        # )
+        # MNIST sequence
+        # X, y, target_label = sample_seq_mnist_data(
+        #     N=N, 
+        #     time_step=time_step, 
+        #     device=device,
+        #     data_dir='./data/mnist_seq/sequences/',
+        #     train=False,
+        #     rnn=verifier  # 篩選預測正確的樣本
+        # )
+        # CIFAR10
+        X, y, target_label = sample_cifar10_data(
+            N=N,
+            time_step=time_step,
+            device=device,
+            data_dir='./data/cifar-10-batches-py/',
+            train=False,
+            rnn=verifier  # 篩選預測正確的樣本
         )
-        torch.set_printoptions(
-            threshold=float('inf'),  # 顯示所有元素
-            linewidth=200,          # 每行字符數
-            edgeitems=10           # 邊緣顯示的元素數
-        )
-        print(f"{X[0]}")
+        # torch.set_printoptions(
+        #     threshold=float('inf'),  # 顯示所有元素
+        #     linewidth=200,          # 每行字符數
+        #     edgeitems=10           # 邊緣顯示的元素數
+        # )
+        # print(f"{X[0]}")
         # X_train, y_train, target_train_label, _, _, _  = prepare_stock_tensors_split(
         #     csv_path='C:/Users/zxczx/POPQORN/vanilla_rnn/utils/A1_bin.csv',
         #     window_size=time_step,
@@ -1595,8 +2082,8 @@ def main():
     # is_verified, unsafe_layer, top1_class, yL_out, yU_out = verifier.verify_network(
     #     X, eps, merge_results=args.merge_results
     # )
-    is_verified, unsafe_layer, top1_class = verifier.verify_network_recursive(
-        X, eps, max_splits=args.max_splits
+    is_verified, unsafe_layer, top1_class, popqorn_safe_count = verifier.verify_network_recursive(
+        X, eps, p, max_splits=args.max_splits, mode=mode, n_workers=args.n_workers
     )
 
     # 準備結果數據
@@ -1604,22 +2091,16 @@ def main():
         'is_verified': is_verified,
         'unsafe_layer': unsafe_layer,
         'top1_class': top1_class.tolist() if hasattr(top1_class, 'tolist') else int(top1_class),
-        'split_count': verifier.split_count
+        'total_samples': N,
+        'split_count': sum(1 for r in verifier.sample_records if r['is_verified']) if hasattr(verifier, 'sample_records') else 0,
+        'popqorn_safe_count': popqorn_safe_count,
+        'zerosplit_safe_count': sum(1 for r in verifier.sample_records if r['all_leaves_verified'])
     }
-    
-    logger.info(f"\n=== Final Results ===")
-    logger.info(f"Predicted class: {top1_class}")
-    if is_verified:
-        logger.info(f"Verification successful!")
-        logger.info(f"Split count: {len(verifier.bound_tracker['split_history'])}")
-    else:
-        logger.info(f"Verification failed")
-        if unsafe_layer:
-            logger.info(f"Unsafe layer: {unsafe_layer}")
-            logger.info(f"Split count: {len(verifier.bound_tracker['split_history'])}")
+    logger.info(f"\nPQ Safe Samples: {popqorn_safe_count}/{N}")
+    logger.info(f"ZS Safe Samples: {results_data['zerosplit_safe_count']}/{N}")
     
     # 保存結果（包含所有captured logs）
-    save_verification_results(json_file, txt_file, log_capture.captured_logs, args, results_data, session_dir)
+    save_verification_results(json_file, txt_file, log_capture.captured_logs, args, results_data, session_dir, verifier)
     
     logger.info(f"\nResults saved to session: {os.path.basename(session_dir)}")
     logger.info(f"JSON detail: {os.path.basename(json_file)}")
