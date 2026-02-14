@@ -5,4 +5,6 @@ __pycache__/
 data/
 *verification_results/
 auto_test_results_*/
+auto_train_results_*/
 shap_test_output/
+*.pdf

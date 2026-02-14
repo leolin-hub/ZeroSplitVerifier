@@ -57,7 +57,7 @@ class TimestepSHAPLocator:
             (timestep, neuron, cross_zero_mask) or (None, None, None) if not found
         """
         if split_history is None:
-            split_history = set()
+            split_history = []
 
         for (t, n), score in ranked:
             # Condition 1: timestep >= start_timestep
@@ -238,144 +238,77 @@ class TimestepSHAPLocator:
         
         return HiddenToOutput(from_timestep, X)
     
-def compute_shap_ranking_once(verifier, X, top1_class, eps, p, top_k_ratio=0.5, shap_threshold=0.8):
+def compute_shap_ranking_once(verifier, X, top1_class, eps, p, top_k_neurons=5):
     """
-    Compute SHAP ranking once for given input X.
+    Compute SHAP ranking once for given input X, filtering cross-zero neurons only.
 
     Args:
         verifier: ZeroSplitVerifier instance
         X: [1, time_step, input_size]
         top1_class: [1] or scalar label
-        top_k_ratio: Select top k ratio of timesteps
+        top_k_neurons: int, select top-k most important cross-zero neurons
 
     Returns:
-        selected_timesteps: [t1, t2, ...] ascending order
-        timestep_importance: {t: importance}
+        selected_neurons: [(t, n, importance), ...] sorted by timestep ascending
     """
-    # ============ [實驗控制區: Anchor + SHAP Block] ============
-    # 如果想恢復原狀，將此處改為 False 即可
-    USE_HYBRID_STRATEGY = False 
-    
-    # 參數設定 (僅在 True 時生效)
-    ANCHOR_RATIO = 0.6  # 預算的 60% 強制給最後面 (例如選5個，這代表 3個給 Anchor)
-    BLOCK_SIZE = 2      # 剩下的預算，找到 Peak 後要切成多大的連續區塊 (1代表只切Peak本身)
-    # =========================================================
     locator = TimestepSHAPLocator(verifier, background_size=20, eps=eps, p=p)
 
-    timestep_importance = {}
+    neuron_importance = []
 
     for t in range(1, verifier.time_step + 1):
         importance = locator._compute_ts_importance(X, locator._generate_background(X), t, top1_class)
-        timestep_importance[t] = importance.sum()
 
-    # Rank timesteps by importance
-    ranked = sorted(timestep_importance.items(), key=lambda x: x[1], reverse=True)
+        l_t = verifier.l[t]
+        u_t = verifier.u[t]
 
-    # Select top k ratio timesteps
-    k = max(1, int(verifier.time_step * top_k_ratio))
-    # selected = [t for t, _ in ranked[:k]] # 原本的選法
-    selected = []
-
-    # ============ 策略分支 ============
-    if USE_HYBRID_STRATEGY:
-        # --- Part A: Anchor (保底機制) ---
-        # 強制選取最後的 num_anchor 個 steps
-        num_anchor = int(k * ANCHOR_RATIO)
+        if l_t is None or u_t is None:
+            continue
         
-        # 確保至少留 1 個給 SHAP Block (除非 k 很小)
-        if k > 1 and num_anchor == k:
-            num_anchor = k - 1
-            
-        anchor_start = verifier.time_step - num_anchor + 1
-        anchor_selection = list(range(anchor_start, verifier.time_step + 1))
-        selected.extend(anchor_selection)
-        
-        # --- Part B: SHAP Block (狙擊機制) ---
-        remaining_budget = k - len(selected)
-        
-        if remaining_budget > 0:
-            # 在 "排除 Anchor 區域" 的範圍內，找 SHAP 最高的那個點 (Peak)
-            # 範圍: 1 ~ (anchor_start - 1)
-            search_range = [t for t in range(1, anchor_start) if t in timestep_importance]
-            
-            if search_range:
-                # 找到最大值的 Time Step
-                peak_t = max(search_range, key=lambda t: timestep_importance[t])
-                
-                # 建立 Block: 從 peak_t 開始往後抓，最多抓 remaining_budget 個
-                # 例如 peak_t=12, remaining=2 -> [12, 13]
-                # 這裡做一個簡單的 Block 擴展 (也可以改成 peak_t 前後擴展，這裡先寫向後)
-                block_selection = []
-                for i in range(remaining_budget):
-                    t_candidate = peak_t + i
-                    if t_candidate < anchor_start: # 不能撞到 Anchor 區
-                        block_selection.append(t_candidate)
-                
-                selected.extend(block_selection)
-                logger.info(f" [Hybrid] Anchor: {anchor_selection}, SHAP Peak at {peak_t}, Block: {block_selection}")
-            else:
-                # 萬一沒有搜尋範圍 (例如 k=time_step)，就全選了
-                pass
+        for n in range(verifier.num_neurons):
+            is_cross_zero = (l_t[:, n] < 0) & (u_t[:, n] > 0)
+            if is_cross_zero.any():
+                neuron_importance.append((t, n, importance[n]))
 
-    else:
-        # ============ 原始版本 (Pure Top-K) ============
-        ranked = sorted(timestep_importance.items(), key=lambda x: x[1], reverse=True)
-        selected = [t for t, _ in ranked[:k]]
-        logger.info(f" [Original] Pure SHAP Top-{k}")
+    # Sort by importance descending
+    neuron_importance.sort(key=lambda x: x[2], reverse=True)
 
-    selected = sorted(list(set(selected)))
-    logger.info(f" Final Selection (Hybrid={USE_HYBRID_STRATEGY}): {selected}")
-    # Method 2: Select timesteps above threshold
-    # total_importance = sum(imp for _, imp in ranked)
-    # cum_imp = 0
-    # selected_by_t = []
+    selected = neuron_importance[:top_k_neurons]
 
-    # for t, imp in ranked:
-    #     cum_imp += imp
-    #     selected_by_t.append(t)
-        
-    #     if cum_imp / total_importance >= shap_threshold:
-    #         break
-    
-    # if len(selected_by_t) < len(selected):
-    #     selected = selected_by_t
-    #     logger.info(f"  SHAP selection: threshold method selected {len(selected)} timesteps "
-    #                 f"(cumulative importance: {cum_imp/total_importance:.2%})")
-    # else:
-    #     logger.info(f"  SHAP selection: ratio method selected {len(selected)} timesteps "
-    #                 f"(top {top_k_ratio:.0%})")
-    # selected.sort()
-    # selected_by_t.sort()
-    
-    return selected, timestep_importance
+    selected.sort(key=lambda x: x[0])
 
-def select_timestep_from_shap(verifier, selected_timesteps, start_timestep, refine_preh, split_history=None, sample_id=None):
+    logger.info(f"  SHAP selected top-{len(selected)} neurons:")
+    for t, n, imp in selected[:5]:
+        logger.info(f"    t={t}, n={n+1}, importance={imp:.4f}")
+    return selected
+
+def select_timestep_from_shap(verifier, selected_neurons, start_timestep, refine_preh, split_history=None, sample_id=None):
     """
-    Select the next timestep to split based on SHAP ranking.
+    Select the next (timestep, neuron) to split based on SHAP ranking.
 
     Args:
         verifier: ZeroSplitVerifier instance
-        selected_timesteps: [t1, t2, ...] sorted by importance descending
+        selected_neurons: [(t, n, importance), ...] sorted by timestep ascending
         start_timestep: int, minimum timestep to consider for splitting
         refine_preh: (l_state, u_state), refinement pre-activation bounds
-        split_history: set of timesteps that have been split
+        split_history: set of (timestep, neuron) tuples that have been split
         sample_id: for logging
 
     Returns:
-        (timestep, cross_zero_mask) or (None, None) if not found.
+        (timestep, neuron_idx, cross_zero_mask) or (None, None, None) if not found.
+        cross_zero_mask: [N, hidden_size] bool tensor with only the selected neuron=True
     """
     if split_history is None:
-        split_history = set()
+        split_history = []
 
-    logger.info(f"  Sample {sample_id+1}: Selecting timestep from {selected_timesteps}")
+    logger.info(f"  Sample {sample_id+1}: Selecting from {len(selected_neurons)} ranked neurons")
     logger.info(f"  start_timestep={start_timestep}, split_history={sorted(list(split_history))}")
 
-    for t in selected_timesteps:
+    for t, n, imp in selected_neurons:
         # Condition 1: timestep >= start_timestep
         if t < start_timestep:
             continue
 
-        if t in split_history:
+        if (t, n) in split_history:
             continue
         
         # Condition 2: pre-activation cross zero
@@ -389,47 +322,121 @@ def select_timestep_from_shap(verifier, selected_timesteps, start_timestep, refi
         if l_t is None or u_t is None:
             continue
 
-        is_cross_zero = (l_t < 0) & (u_t > 0)
+        # Check if this specific neuron crosses zero
+        is_cross_zero = (l_t[:, n] < 0) & (u_t[:, n] > 0)
 
         if is_cross_zero.any():
-            num_cross = is_cross_zero.sum().item()
-            logger.info(f"  Selected timestep {t} with {num_cross} cross-zero neurons")
-            return t, is_cross_zero
+            # Create mask with only this neuron set to True
+            cross_zero_mask = torch.zeros_like(l_t, dtype=torch.bool)
+            cross_zero_mask[:, n] = is_cross_zero
+            
+            logger.info(f"  Selected t={t}, n={n+1}, importance={imp:.4f}")
+            return t, n, cross_zero_mask
         
-    logger.info(f"  No valid timestep found for sample {sample_id+1}")
-    return None, None  # No valid split found
+    logger.info(f"  No valid (timestep, neuron) found for sample {sample_id+1}")
+    return None, None, None
 
 # ============ 測試程式碼 ============
 if __name__ == "__main__":
     import os
+    import time
+    import itertools
+    import pandas as pd
+    from datetime import datetime
     from zerosplit_verifier import ZeroSplitVerifier
-    from utils.sample_data import sample_mnist_data
+    from utils.sample_cifar10 import sample_cifar10_data
 
-    time_step = 2
-    input_size = 392
-    output_size = 10
-    N = 1
-    p = 2
-    hidden_size = 16
-    activation = 'relu'
-    max_splits = 1
-    eps = 0.1
-    work_dir = "C:/Users/zxczx/models/mnist_classifier/rnn_2_16_relu/"
-    
+    # === Config ===
+    CONFIG = {
+        'timesteps': [12],
+        'eps_values': [0.03],
+        'activations': ['relu'],
+        'hidden_size': 64,
+        'N': 500,
+        'p': 2,
+        'max_splits': {
+            8: 8,
+            12: 12,
+        },
+        'base_work_dir': 'C:/Users/zxczx/models/cifar10_classifier/',
+        'data_dir': './data/cifar-10-batches-py/',
+    }
+
     device = torch.device('cpu')
+    results = []
 
-    verifier = ZeroSplitVerifier(input_size, hidden_size, output_size, time_step, 
-                                   activation, max_splits=max_splits, debug=False)
+    combinations = list(itertools.product(
+        CONFIG['timesteps'],
+        CONFIG['eps_values'],
+        CONFIG['activations']
+    ))
 
-    model_file = os.path.join(work_dir, "rnn")
-    verifier.load_state_dict(torch.load(model_file, map_location='cpu'))
-    verifier.to(device)
+    print(f"\n{'='*60}")
+    print(f"SHAP Timing Benchmark")
+    print(f"{'='*60}")
+    print(f"Samples per config: {CONFIG['N']}")
+    print(f"Total configs: {len(combinations)}")
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}\n")
+
+    for ts, eps, act in combinations:
+        work_dir = f"{CONFIG['base_work_dir']}rnn_{ts}_{CONFIG['hidden_size']}_{act}/"
+        input_size = int(32 * 32 * 3 / ts)
+        
+        print(f"Config: ts={ts}, eps={eps}, act={act}", end=" ... ")
+
+        verifier = ZeroSplitVerifier(
+            input_size, CONFIG['hidden_size'], 10, ts, act, max_splits=CONFIG['max_splits'][ts]
+        )
+        model_file = os.path.join(work_dir, "rnn")
+        
+        try:
+            verifier.load_state_dict(torch.load(model_file, map_location='cpu'))
+        except FileNotFoundError:
+            print("SKIP (model not found)")
+            continue
+            
+        verifier.to(device)
+        verifier.extractWeight(clear_original_model=False)
+
+        X, y, top1 = sample_cifar10_data(
+            N=CONFIG['N'], time_step=ts, device=device,
+            data_dir=CONFIG['data_dir'], train=False, rnn=verifier
+        )
+
+        sample_times = []
+        for i in range(CONFIG['N']):
+            X_i = X[i:i+1]
+            top1_i = top1[i:i+1]
+            
+            start = time.time()
+            _, _ = compute_shap_ranking_once(verifier, X_i, top1_i, eps, CONFIG['p'])
+            elapsed = time.time() - start
+            sample_times.append(elapsed)
+
+        avg_time = sum(sample_times) / len(sample_times)
+        std_time = (sum((t - avg_time)**2 for t in sample_times) / len(sample_times)) ** 0.5
+        
+        results.append({
+            'timestep': ts,
+            'eps': eps,
+            'activation': act,
+            'N': CONFIG['N'],
+            'avg_time': round(avg_time, 4),
+            'std_time': round(std_time, 4),
+            'min_time': round(min(sample_times), 4),
+            'max_time': round(max(sample_times), 4),
+        })
+        
+        print(f"avg={avg_time:.4f}s, std={std_time:.4f}s")
+
+    print(f"\n{'='*60}")
+    print("Results Summary")
+    print(f"{'='*60}")
     
-    X, y, target_label = sample_mnist_data(
-        N=N, seq_len=time_step, device=device,
-        data_dir='../data/mnist', train=False, shuffle=True, rnn=verifier
-    )
+    df = pd.DataFrame(results)
+    print(df.to_string(index=False))
     
-    verifier.extractWeight(clear_original_model=False)
-
-    is_verified_i, top1_i, yL_out_i, yU_out_i = verifier.verify_robustness(X, eps)
+    output_file = f"shap_timing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    df.to_excel(output_file, index=False)
+    print(f"\nSaved to: {output_file}")
