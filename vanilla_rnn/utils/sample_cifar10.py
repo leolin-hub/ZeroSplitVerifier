@@ -12,7 +12,7 @@ def sample_cifar10_data(N, time_step, device, num_labels=10,
                         data_dir='./data', train=False, use_rgb=True,
                         shuffle=True, rnn=None, x=None, y=None):
     """
-    Sample N correctly predicted samples from CIFAR-10
+    Sample N samples from CIFAR-10
     
     Returns:
         x: [N, time_step, input_dim] sequences
@@ -36,10 +36,10 @@ def sample_cifar10_data(N, time_step, device, num_labels=10,
         dataset = CIFAR10SequenceDataset(
             data_dir, train=train, time_step=time_step, use_rgb=use_rgb
         )
-        loader = torch.utils.data.DataLoader(dataset, batch_size=N*2, shuffle=shuffle)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=N, shuffle=shuffle)
         
         collected_x, collected_y, collected_target = [], [], []
-        total_sampled = 0
+        total_correct = 0
         total_checked = 0
         
         for batch_x, batch_y in loader:
@@ -51,22 +51,22 @@ def sample_cifar10_data(N, time_step, device, num_labels=10,
             
             out = rnn(batch_x)
             pred = out.argmax(dim=1)
-            idx = (pred == batch_y)
+            correct = (pred == batch_y).sum().item()
             
-            collected_x.append(batch_x[idx])
-            collected_y.append(batch_y[idx])
-            collected_target.append(batch_target[idx])
-            total_sampled += idx.sum().item()
-            total_checked += len(idx)
+            collected_x.append(batch_x)
+            collected_y.append(batch_y)
+            collected_target.append(batch_target)
+            total_correct += correct
+            total_checked += len(batch_y)
             
-            if total_sampled >= N:
+            if len(torch.cat(collected_x, dim=0)) >= N:  # 改為檢查總數
                 break
         
         x = torch.cat(collected_x, dim=0)[:N]
         y = torch.cat(collected_y, dim=0)[:N]
         target_label = torch.cat(collected_target, dim=0)[:N]
         
-        accuracy = total_sampled / total_checked if total_checked > 0 else 0
-        print(f'Correctly predicted: {total_sampled}/{total_checked} ({100*accuracy:.1f}%), Collected {len(x)} samples')
+        accuracy = total_correct / total_checked if total_checked > 0 else 0
+        print(f'Collected {len(x)} samples, Correctly predicted: {total_correct}/{total_checked} ({100*accuracy:.1f}%)')
     
     return x, y, target_label
