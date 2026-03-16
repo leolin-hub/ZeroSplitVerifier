@@ -95,8 +95,7 @@ def sigmoid_lower(beta, k,b,y_minus,y_plus, plot=False, num=0):
         loss[between] = k[between]*x0 + b[between] - y0
     
     if zero.sum()>0:
-        #there may be a problem here, consider the confidence problem
-        loss[zero] = torch.relu(k*y_minus + b) + torch.relu(k*y_plus+b)   
+        loss[zero] = torch.relu(k[zero]*y_minus[zero] + b[zero]) + torch.relu(k[zero]*y_plus[zero] + b[zero])
     if plot:
         x = np.linspace(y_minus[num].item(), y_plus[num].item())
         y = beta[num].item() * sigmoid(x)
@@ -179,8 +178,7 @@ def tanh_lower(alpha, k,b,x_minus,x_plus, plot=False, num=0):
         loss[between] = k[between]*x0 + b[between] - y0
     
     if zero.sum()>0:
-        #there may be a problem here, consider the confidence problem
-        loss[zero] = torch.relu(k*x_minus + b) + torch.relu(k*x_plus+b)       
+        loss[zero] = torch.relu(k[zero]*x_minus[zero] + b[zero]) + torch.relu(k[zero]*x_plus[zero] + b[zero])
     if plot:
         x = np.linspace(x_minus[num].item(), x_plus[num].item())
         y = alpha[num].item() * np.tanh(x)
