@@ -69,7 +69,7 @@ class LSTMNeuronLocator:
 
                 for n in range(self.verifier.hidden_size):
                     if gate_cross[:, n].any():
-                        candidates.append(((t, gate, n), float(gate_imp[n])))
+                        candidates.append(((t, gate, n), round(float(gate_imp[n]), 6)))
 
         candidates.sort(key=lambda x: x[1], reverse=True)
         candidates = candidates[:self.top_k]

@@ -14,6 +14,7 @@ import bound_x_sigmoidy as x_sigmoid
 from get_bound_for_general_activation_function import getConvenientGeneralActivationBound
 
 import copy
+from loguru import logger
 
 def get_q(p):
     if p == 1:
@@ -186,6 +187,16 @@ class My_lstm(nn.Module):
         #each time step bound tanh(yg[:,m,:]) * sigmoid(yi[:,m,:])
         # a_l,b_l,c_l,a_u,b_u,c_u = tanh_sigmoid.bound_tanh_sigmoid(
         #     self.yg_l[m-1], self.yg_u[m-1], self.yi_l[m-1], self.yi_u[m-1])
+        _yg_inv = (self.yg_u[m-1] - self.yg_l[m-1] < 0)
+        _yi_inv = (self.yi_u[m-1] - self.yi_l[m-1] < 0)
+        if _yg_inv.any():
+            viol = (self.yg_l[m-1] - self.yg_u[m-1])[_yg_inv].max().item()
+            logger.info(f'[DEBUG get_hig] t={m}: yg inversion {_yg_inv.sum()} neurons, max={viol:.3e}')
+            assert viol < 1e-4, f'get_hig yg large inversion {viol:.3e}'
+        if _yi_inv.any():
+            viol = (self.yi_l[m-1] - self.yi_u[m-1])[_yi_inv].max().item()
+            logger.info(f'[DEBUG get_hig] t={m}: yi inversion {_yi_inv.sum()} neurons, max={viol:.3e}')
+            assert viol < 1e-4, f'get_hig yi large inversion {viol:.3e}'
         b_l,a_l,c_l,b_u,a_u,c_u = tanh_sigmoid.bound_tanh_sigmoid(
             self.yg_l[m-1], self.yg_u[m-1], self.yi_l[m-1], self.yi_u[m-1],
             use_1D_line = self.use_1D_line,
@@ -204,8 +215,18 @@ class My_lstm(nn.Module):
         #compute hoc of the m time step
         #m could range from 1 to seq_len
         #bound tanh(c[:,m,:]) * sigmoid(yo[:,m,:])
+        _c_inv  = (self.c_u[m-1]  - self.c_l[m-1]  < 0)
+        _yo_inv = (self.yo_u[m-1] - self.yo_l[m-1] < 0)
+        if _c_inv.any():
+            viol = (self.c_l[m-1] - self.c_u[m-1])[_c_inv].max().item()
+            logger.info(f'[DEBUG get_hoc] t={m}: c inversion {_c_inv.sum()} neurons, max={viol:.3e}')
+            assert viol < 1e-4, f'get_hoc c large inversion {viol:.3e}'
+        if _yo_inv.any():
+            viol = (self.yo_l[m-1] - self.yo_u[m-1])[_yo_inv].max().item()
+            logger.info(f'[DEBUG get_hoc] t={m}: yo inversion {_yo_inv.sum()} neurons, max={viol:.3e}')
+            assert viol < 1e-4, f'get_hoc yo large inversion {viol:.3e}'
         b_l,a_l,c_l,b_u,a_u,c_u = tanh_sigmoid.bound_tanh_sigmoid(
-            self.c_l[m-1].detach(), self.c_u[m-1].detach(), 
+            self.c_l[m-1].detach(), self.c_u[m-1].detach(),
             self.yo_l[m-1].detach(), self.yo_u[m-1].detach(),
             use_1D_line = self.use_1D_line,
             use_constant = self.use_constant,

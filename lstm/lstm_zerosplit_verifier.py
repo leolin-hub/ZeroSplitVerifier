@@ -141,6 +141,31 @@ class LSTMZeroSplitVerifier(My_lstm):
             self.get_hoc(k)
             self.get_Wa_b(W_eye, 0, k, x, eps, p, save_a=True, eps_idx=eps_idx)
 
+    def _apply_split(self, gate_l, gate_u, t, n, orig_l, orig_u, side,
+                     eps, p, x, eps_idx):
+        """
+        將 gate 還原到 orig，套用單側 clamp，再從 timestep t 重算所有 bounds。
+        side='neg' → gate_u[:,n] clamp ≤ 0  (gate 只能負值)
+        side='pos' → gate_l[:,n] clamp ≥ 0  (gate 只能正值)
+        每次進入新的 branch 前都從 orig 重設，確保不受另一 branch 殘留影響。
+        """
+        gate_l[t-1] = orig_l.clone()
+        gate_u[t-1] = orig_u.clone()
+        if side == 'neg':
+            gate_u[t-1][:, n].clamp_(max=0.0)
+        else:
+            gate_l[t-1][:, n].clamp_(min=0.0)
+        self._recompute_from(t, eps, p, x, eps_idx)
+
+    def _restore_gate(self, gate_l, gate_u, t, orig_l, orig_u):
+        """
+        還原 gate 到 split 前的原始值（不含 _recompute_from）。
+        neg 失敗時使用：parent 的 _recompute_from 會從自己的 t 往後重算，
+        所以這裡只需確保 gate 值正確，不需要自行重算 bounds。
+        """
+        gate_l[t-1] = orig_l
+        gate_u[t-1] = orig_u
+
     def _is_verified(self, minimum, maximum, true_label):
         """
         對每個樣本 i（真實標籤 L），檢查是否：
@@ -231,6 +256,7 @@ class LSTMZeroSplitVerifier(My_lstm):
 
             v._pq_min = pq_min
             v._pq_max = pq_max
+            v._leaf_margins = []
             _t0 = time.perf_counter()
             zs_verified = v._evr_recursive(
                 eps, p, x_i, y_i, eps_idx,
@@ -241,7 +267,20 @@ class LSTMZeroSplitVerifier(My_lstm):
             _e['total_sec'] += time.perf_counter() - _t0
             _e['count'] += 1
 
-            last_result = {'eps': eps, 'pq_verified': pq_verified, 'zs_verified': zs_verified}
+            L_val = int(y_i[0].item())
+            mask_val = torch.arange(pq_max.shape[1]) != L_val
+            pq_margin_val = (pq_min[0, L_val] - pq_max[0][mask_val].max()).item()
+            zs_margin_val = min(v._leaf_margins) if v._leaf_margins else None
+            gain_val = (zs_margin_val - pq_margin_val) if zs_margin_val is not None else None
+
+            last_result = {
+                'eps': eps,
+                'pq_verified': pq_verified,
+                'zs_verified': zs_verified,
+                'pq_margin': round(pq_margin_val, 6),
+                'zs_margin': round(zs_margin_val, 6) if zs_margin_val is not None else None,
+                'gain': round(gain_val, 6) if gain_val is not None else None,
+            }
 
             if not pq_verified and zs_verified:
                 sample_flag = 'zs_better'
@@ -255,7 +294,7 @@ class LSTMZeroSplitVerifier(My_lstm):
         return sample_id, sample_flag, sample_eps, last_result, v.timing_stats
 
     def verify_evr(self, X, true_label, p, eps_range, precision=0.001,
-                   max_splits=None, eps_idx=None, background_size=20, top_k=3,
+                   max_splits=None, eps_idx=None, background_size=20, top_k=5,
                    n_workers=None, save_dir=None):
         """
         對每個樣本逐一執行 eps_range 內的驗證流程：
@@ -326,6 +365,9 @@ class LSTMZeroSplitVerifier(My_lstm):
                 'sample_id': sample_id, 'flag': flag, 'eps': eps_r,
                 'pq_verified': result['pq_verified'] if result else None,
                 'zs_verified': result['zs_verified'] if result else None,
+                'pq_margin': result.get('pq_margin') if result else None,
+                'zs_margin': result.get('zs_margin') if result else None,
+                'gain':      result.get('gain')      if result else None,
             })
             for key, vals in t_stats.items():
                 e = agg_timing.setdefault(key, {'total_sec': 0.0, 'count': 0})
@@ -362,6 +404,7 @@ class LSTMZeroSplitVerifier(My_lstm):
         minimum, maximum = self._get_output_bounds(eps, p, x, eps_idx)
 
         # Log margin comparison vs original PQ bounds
+        cur_margin = None
         if hasattr(self, '_pq_min') and self._pq_min is not None:
             L = int(true_label[0].item())
             nc = minimum.shape[1]
@@ -373,63 +416,67 @@ class LSTMZeroSplitVerifier(My_lstm):
                 f"margin={cur_margin:.6f}  PQ={pq_margin:.6f}  gain={cur_margin - pq_margin:.6f}"
             )
 
+        # 子問題是否驗證成功
         if self._is_verified(minimum, maximum, true_label) and split_history:
+            if cur_margin is not None and hasattr(self, '_leaf_margins'):
+                self._leaf_margins.append(cur_margin)
             logger.info(f"  [S{sid}] Verified at depth {depth}.")
             return True
 
+        # 上述仍未驗證成功進入到這裡，代表需要繼續split；但若已達 max_splits 則不再split，直接回傳 False。
         if depth >= max_splits:
+            if cur_margin is not None and hasattr(self, '_leaf_margins'):
+                self._leaf_margins.append(cur_margin)
             logger.info(f"  [S{sid}] Max splits ({max_splits}) reached, unverified.")
             return False
 
         t, gate, n = locator.select_next_split(ranked, split_history=split_history)
         if t is None:
             already = self._is_verified(minimum, maximum, true_label)
+            if cur_margin is not None and hasattr(self, '_leaf_margins'):
+                self._leaf_margins.append(cur_margin)
             logger.info(
                 f"  [S{sid}] No valid split target found. "
                 f"Falling back to current bounds: {'verified' if already else 'unverified'}."
             )
             return already
 
-        logger.info(f"  [S{sid}] depth={depth} split: t={t}, gate={gate}, n={n}")
-        new_history = split_history | {(t, gate, n)}
-
+        new_history = split_history | {(t, gate, n)} # 選好後加入history
         gate_l = getattr(self, f'y{gate}_l')
         gate_u = getattr(self, f'y{gate}_u')
         orig_l = gate_l[t-1].clone()
         orig_u = gate_u[t-1].clone()
 
-        # neg sub-problem
-        gate_l[t-1] = orig_l.clone()
-        gate_u[t-1] = orig_u.clone()
-        gate_u[t-1][:, n].clamp_(max=0.0)
-        self._recompute_from(t, eps, p, x, eps_idx)
+        # --- neg branch: gate ≤ 0 ---
+        logger.info(f"  [S{sid}] depth={depth} neg: t={t}, gate={gate}[{n}] u→clamp(0)")
+        self._apply_split(gate_l, gate_u, t, n, orig_l, orig_u, side='neg',
+                          eps=eps, p=p, x=x, eps_idx=eps_idx)
         neg_ok = self._evr_recursive(eps, p, x, true_label, eps_idx,
                                      depth + 1, new_history,
                                      max_splits, locator, ranked)
 
-        # neg 子樹失敗 → 整體必為 False，跳過 pos 子樹（DFS 剪枝）
         if not neg_ok:
-            gate_l[t-1] = orig_l
-            gate_u[t-1] = orig_u
-            self._recompute_from(t, eps, p, x, eps_idx)
-            logger.info(f"  [S{sid}] Neg branch failed, skipping pos.")
+            # neg 子樹失敗 → 整體必為 False，跳過 pos 子樹（DFS 剪枝）。
+            # 只還原 gate 值；parent 的 _recompute_from 會重算後續所有 bounds，
+            # 所以這裡不需要額外呼叫 _recompute_from。
+            self._restore_gate(gate_l, gate_u, t, orig_l, orig_u)
+            logger.info(f"  [S{sid}] depth={depth} neg failed → skip pos, propagate False")
             return False
 
-        # pos sub-problem
-        gate_l[t-1] = orig_l.clone()
-        gate_u[t-1] = orig_u.clone()
-        gate_l[t-1][:, n].clamp_(min=0.0)
-        self._recompute_from(t, eps, p, x, eps_idx)
+        # --- pos branch: gate ≥ 0 ---
+        logger.info(f"  [S{sid}] depth={depth} pos: t={t}, gate={gate}[{n}] l→clamp(0)")
+        self._apply_split(gate_l, gate_u, t, n, orig_l, orig_u, side='pos',
+                          eps=eps, p=p, x=x, eps_idx=eps_idx)
         pos_ok = self._evr_recursive(eps, p, x, true_label, eps_idx,
                                      depth + 1, new_history,
                                      max_splits, locator, ranked)
 
-        # Restore and propagate
-        gate_l[t-1] = orig_l
-        gate_u[t-1] = orig_u
+        # --- restore original gate + recompute（此層的 split 已處理完畢）---
+        self._restore_gate(gate_l, gate_u, t, orig_l, orig_u)
         self._recompute_from(t, eps, p, x, eps_idx)
+        logger.info(f"  [S{sid}] depth={depth} done: neg={neg_ok} pos={pos_ok} → {pos_ok}")
 
-        return neg_ok and pos_ok
+        return pos_ok  # neg_ok is True here
 
 
 # ------------------------------------------------------------------
@@ -513,9 +560,9 @@ def main():
     parser = argparse.ArgumentParser(
         description='LSTM ZeroSplit Verifier — EVR verification'
     )
-    parser.add_argument('--hidden-size', default=16, type=int, metavar='HS',
+    parser.add_argument('--hidden-size', default=64, type=int, metavar='HS',
                         help='hidden layer size (default: 32)')
-    parser.add_argument('--time-step', default=4, type=int, metavar='TS',
+    parser.add_argument('--time-step', default=8, type=int, metavar='TS',
                         help='sequence length / time steps (default: 8)')
     parser.add_argument('--use-rgb', default=True, type=bool,
                         help='use RGB (3072) or grayscale (1024) (default: True)')
@@ -525,7 +572,7 @@ def main():
                         help='directory containing the pretrained model')
     parser.add_argument('--cuda', action='store_true',
                         help='use GPU if available')
-    parser.add_argument('--N', default=5, type=int,
+    parser.add_argument('--N', default=10, type=int,
                         help='number of test samples (default: 5)')
     parser.add_argument('--p', default=2, type=int,
                         help='lp-norm; p > 100 is treated as inf (default: 2)')
@@ -533,10 +580,10 @@ def main():
                         help='perturbation radius (default: 0.005)')
     parser.add_argument('--eps-min', default=0.005, type=float,
                         help='eps range lower bound for verify_evr (default: 0.001)')
-    parser.add_argument('--eps-max', default=0.007, type=float,
+    parser.add_argument('--eps-max', default=0.005, type=float,
                         help='eps range upper bound for verify_evr (default: 0.01)')
-    parser.add_argument('--max-splits', default=3, type=int,
-                        help='max ZeroSplit iterations (default: 3)')
+    parser.add_argument('--max-splits', default=5, type=int,
+                        help='max ZeroSplit iterations (default: 5)')
     parser.add_argument('--n-workers', default=None, type=int,
                         help='number of parallel worker processes (default: auto = cpu_count)')
     parser.add_argument('--save-dir', default='./lstm/evr_results', type=str,
@@ -588,13 +635,6 @@ def main():
         n_workers=args.n_workers,
         save_dir=args.save_dir,
     )
-
-    logger.info('\nPer-sample results:')
-    for i, (flag, eps_result, result) in enumerate(results):
-        logger.info(
-            f'  Sample {i}: {flag}, eps={eps_result:.3f}, '
-            f'pq={result["pq_verified"]}, zs={result["zs_verified"]}'
-        )
 
 
 if __name__ == '__main__':
