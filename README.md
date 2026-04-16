@@ -8,49 +8,14 @@ Certified local robustness verification for recurrent neural networks (RNNs) is 
 
 ## Overview
 
-This repository implements an **abstraction-refinement (ZeroSplit)** verification framework for recurrent neural networks, inspired by the CROWN-style linear bound propagation approach of [POPQORN (ICML 2019)](https://arxiv.org/abs/1905.07387). Two network families are supported:
+This repository implements an **abstraction-refinement (ZeroSplit)** verification framework for recurrent neural networks. Two network families are supported:
 
 | Network | Activation | Splitting target | Optimal branching |
 |---------|-----------|-----------------|-------------------|
 | Vanilla RNN | ReLU / tanh | Hidden state pre-activation (single scalar) | Fixed at 0 |
-| LSTM | Sigmoid / tanh / ReLU-g | Gate pre-activation (one of i/f/g/o) | Pre-computed p* via LUT |
+| LSTM *(Ongoing Work)* | Sigmoid / tanh | Gate pre-activation (one of i/f/g/o) | Pre-computed p* via LUT |
 
 The key idea in both cases is **ZeroSplit**: identify neurons whose pre-activation interval crosses zero (worst case for linear relaxation), split the interval into a negative branch and a positive branch, certify each branch independently with tighter bounds, and return `verified` only when both branches succeed.
-
----
-
-## Repository Structure
-
-```
-POPQORN/
-├── vanilla_rnn/                   # Vanilla RNN verification
-│   ├── bound_vanilla_rnn.py       # Core RNN bound propagation
-│   ├── rnn_zerosplit_verifier.py  # ZeroSplit verifier (EVR loop)
-│   ├── zerosplit_verifier.py      # ZeroSplit verifier (fixed-eps mode)
-│   ├── zsv.py                     # Shared ZeroSplit helpers
-│   ├── locate_timestep_shap.py    # SHAP-guided (timestep, neuron) ranking
-│   ├── get_bound_for_general_activation_function.py  # CROWN linear bounds
-│   ├── train_rnn_cifar10.py       # CIFAR-10 RNN trainer
-│   ├── train_rnn_mnist_classifier.py
-│   ├── train_rnn_mnist_seq.py
-│   └── utils/                     # Data loaders (MNIST, seq-MNIST, CIFAR-10)
-│
-├── lstm/                          # LSTM verification
-│   ├── lstm.py                    # My_lstm: core bound propagation
-│   ├── lstm_relu.py               # My_relu_lstm: ReLU-g gate variant
-│   ├── lstm_zerosplit_verifier.py # LSTMZeroSplitVerifier + ReLULSTMZeroSplitVerifier
-│   ├── branching_point_optimizer.py  # Offline LUT builder for optimal p*
-│   ├── locate_neuron_lstm.py      # SHAP-guided (t, gate, neuron) ranking
-│   ├── bound_tanhx_sigmoidy.py    # 2D bounding planes for tanh(x)·σ(y)
-│   ├── bound_x_sigmoidy.py        # 2D bounding planes for x·σ(y)
-│   ├── train_cifar10_lstm.py
-│   ├── train_mnist_lstm.py
-│   └── train_mnist_relu_lstm.py
-│
-├── lookup_tables/                 # Pre-built branching point LUTs (pkl)
-├── data/                          # Datasets
-└── models/                        # Saved model checkpoints
-```
 
 ---
 
@@ -85,7 +50,7 @@ For **LSTM**, the optimal split point `p*` is looked up from a pre-built table (
 
 Rather than exhaustive search, SHAP values identify which `(timestep, neuron)` pairs contribute most to the output margin. The ranking is computed once per sample and reused throughout the DFS tree. Timesteps are visited in **temporal order** (non-decreasing) to ensure each split's downstream recomputation is minimal.
 
-### 4. Optimal Branching Point (LSTM only)
+### 4. Optimal Branching Point (LSTM only) *(Ongoing Work)*
 
 For LSTM gates with smooth activations (tanh, Sigmoid), splitting at zero is not optimal. The branching point optimizer pre-computes:
 
@@ -137,8 +102,8 @@ python vanilla_rnn/train_rnn_mnist_classifier.py \
 python lstm/train_cifar10_lstm.py \
     --hidden-size 64 --time-step 8
 
-# MNIST ReLU-LSTM (hidden=64, T=4)
-python lstm/train_mnist_relu_lstm.py \
+# MNIST LSTM (hidden=64, T=4)
+python lstm/train_mnist_lstm.py \
     --hidden-size 64 --time-step 4
 ```
 
@@ -146,7 +111,7 @@ python lstm/train_mnist_relu_lstm.py \
 
 ## Verification
 
-### Vanilla RNN — EVR (Epsilon-Value-Range) Mode
+### Vanilla RNN — EVR (Exact Verifiable Robustness) Mode
 
 ```bash
 python vanilla_rnn/rnn_zerosplit_verifier.py \
@@ -171,7 +136,7 @@ Key arguments:
 | `--n-workers` | Parallel workers (default: `cpu_count`) |
 | `--save-dir` | Output directory for JSON results |
 
-### LSTM — EVR Mode
+### LSTM — EVR (Exact Verifiable Robustness) Mode
 
 ```bash
 python lstm/lstm_zerosplit_verifier.py \
@@ -183,18 +148,12 @@ python lstm/lstm_zerosplit_verifier.py \
     --max-splits 5 \
     --lut-dir ./lookup_tables \
     --save-dir ./lstm/evr_results
-
-# ReLU-LSTM variant
-python lstm/lstm_zerosplit_verifier.py \
-    --relu --hidden-size 64 --time-step 4 --dataset mnist \
-    --max-splits 5 --lut-dir ./lookup_tables
 ```
 
 Additional LSTM arguments:
 
 | Argument | Description |
 |----------|-------------|
-| `--relu` | Use ReLU-g gate variant |
 | `--lut-dir` | Directory with pre-built branching point LUTs |
 | `--gate-filter` | Restrict splits to specific gates, e.g. `g` or `g,i` |
 
