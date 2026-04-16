@@ -339,16 +339,16 @@ def select_timestep_from_shap(verifier, selected_neurons, start_timestep, refine
 # ============ 測試程式碼 ============
 _DATASET_CFGS = {
     'cifar10': {
-        'base_model_dir': 'C:/Users/zxczx/models/cifar10_classifier/',
+        'base_model_dir': './models/cifar10_classifier/',
         'model_prefix':   'rnn',
-        'data_dir':       'C:/Users/zxczx/POPQORN/vanilla_rnn/data/cifar-10-batches-py/',
+        'data_dir':       './data/cifar-10-batches-py/',
         'input_size_fn':  lambda ts: int(32 * 32 * 3 / ts),
         'num_classes':    10,
     },
     'mnist_seq': {
-        'base_model_dir': 'C:/Users/zxczx/models/mnist_seq_classifier/',
+        'base_model_dir': './models/mnist_seq_classifier/',
         'model_prefix':   'rnn_seq',
-        'data_dir':       'C:/Users/zxczx/POPQORN/vanilla_rnn/data/mnist_seq/sequences/',
+        'data_dir':       './data/mnist_seq/sequences/',
         'input_size_fn':  lambda ts: 3,
         'num_classes':    10,
     },
@@ -511,7 +511,6 @@ if __name__ == "__main__":
         df = pd.DataFrame(all_rows)
         ds_tag = '_'.join(sorted(set(r['dataset']   for r in all_rows)))
         ts_tag = '-'.join(str(t) for t in sorted(set(r['time_step'] for r in all_rows)))
-        out_file = (f"C:/Users/zxczx/POPQORN/vanilla_rnn/"
-                    f"shap_timing_{ds_tag}_ts{ts_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        out_file = (f"shap_timing_{ds_tag}_ts{ts_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
         df.to_excel(out_file, index=False)
         print(f"\nSaved {len(all_rows)} rows to: {out_file}")

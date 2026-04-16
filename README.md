@@ -173,15 +173,3 @@ python vanilla_rnn/rnn_zerosplit_verifier.py --toy-rnn --max-splits 2
 | `zs_better` | Baseline failed at some eps, ZeroSplit succeeded — refinement helped |
 | `both_fail` | Both baseline and ZeroSplit failed up to eps_max |
 
----
-
-## Citation
-
-```bibtex
-@inproceedings{ko2019popqorn,
-  title     = {POPQORN: Quantifying Robustness of Recurrent Neural Networks},
-  author    = {Ko, Ching-Yun and Lyu, Zhiyuan and Weng, Lily and Daniel, Luca and Wong, Ngai and Lin, Dahua},
-  booktitle = {ICML},
-  year      = {2019}
-}
-```

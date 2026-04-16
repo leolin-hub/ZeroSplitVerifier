@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import torch
 import numpy as np
@@ -82,7 +83,7 @@ def prepare_stock_tensors_split(csv_path, window_size=10, train_ratio=0.8, devic
             X_test.to(device), y_test.to(device), target_test.to(device))
 
 if __name__ == "__main__":
-    csv_path = 'C:/Users/zxczx/POPQORN/vanilla_rnn/utils/A1_bin.csv'
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'A1_bin.csv')
     window_size = 10
     train_ratio = 0.8
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

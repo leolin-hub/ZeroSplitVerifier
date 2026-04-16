@@ -448,9 +448,9 @@ def main():
     parser.add_argument('--cuda', action='store_true')
 
     # Dataset Parameters
-    parser.add_argument('--model-base-dir', default="C:/Users/zxczx/models/", 
+    parser.add_argument('--model-base-dir', default='./models/',
                        help='Base directory for model files')
-    parser.add_argument('--stock-data-path', default='C:/Users/zxczx/POPQORN/vanilla_rnn/utils/A1_bin.csv')
+    parser.add_argument('--stock-data-path', default='./utils/A1_bin.csv')
     parser.add_argument('--mnist-data-path', default='../data/mnist', 
                        help='Path to MNIST data directory')
 
