@@ -337,106 +337,181 @@ def select_timestep_from_shap(verifier, selected_neurons, start_timestep, refine
     return None, None, None
 
 # ============ 測試程式碼 ============
-if __name__ == "__main__":
-    import os
-    import time
-    import itertools
-    import pandas as pd
-    from datetime import datetime
+_DATASET_CFGS = {
+    'cifar10': {
+        'base_model_dir': 'C:/Users/zxczx/models/cifar10_classifier/',
+        'model_prefix':   'rnn',
+        'data_dir':       'C:/Users/zxczx/POPQORN/vanilla_rnn/data/cifar-10-batches-py/',
+        'input_size_fn':  lambda ts: int(32 * 32 * 3 / ts),
+        'num_classes':    10,
+    },
+    'mnist_seq': {
+        'base_model_dir': 'C:/Users/zxczx/models/mnist_seq_classifier/',
+        'model_prefix':   'rnn_seq',
+        'data_dir':       'C:/Users/zxczx/POPQORN/vanilla_rnn/data/mnist_seq/sequences/',
+        'input_size_fn':  lambda ts: 3,
+        'num_classes':    10,
+    },
+}
+
+def _shap_timing_worker(args):
+    """Module-level worker — 處理單一 config 的 sample[sample_start:sample_end]。"""
+    import os, time, torch, sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from zerosplit_verifier import ZeroSplitVerifier
     from utils.sample_cifar10 import sample_cifar10_data
+    from utils.sample_seq_mnist import sample_seq_mnist_data
 
-    # === Config ===
-    CONFIG = {
-        'timesteps': [12],
-        'eps_values': [0.03],
-        'activations': ['relu'],
-        'hidden_size': 64,
-        'N': 500,
-        'p': 2,
-        'max_splits': {
-            8: 8,
-            12: 12,
-        },
-        'base_work_dir': 'C:/Users/zxczx/models/cifar10_classifier/',
-        'data_dir': './data/cifar-10-batches-py/',
+    dataset_name, ts, h, act, eps_values, N, P, sample_start, sample_end = args
+    cfg = _DATASET_CFGS[dataset_name]
+    device = torch.device('cpu')
+
+    model_file = os.path.join(cfg['base_model_dir'], f"{cfg['model_prefix']}_{ts}_{h}_{act}", 'rnn')
+    if not os.path.exists(model_file):
+        print(f"[SKIP] {dataset_name} ts={ts} h={h} act={act}: model not found", flush=True)
+        return []
+
+    input_size = cfg['input_size_fn'](ts)
+    verifier = ZeroSplitVerifier(input_size, h, cfg['num_classes'], ts, act, max_splits=5)
+    verifier.load_state_dict(torch.load(model_file, map_location='cpu'))
+    verifier.to(device)
+    verifier.extractWeight(clear_original_model=False)
+
+    if dataset_name == 'cifar10':
+        X, y, top1 = sample_cifar10_data(
+            N=N, time_step=ts, device=device,
+            data_dir=cfg['data_dir'], train=False, rnn=verifier,
+        )
+    else:
+        X, y, top1 = sample_seq_mnist_data(
+            N=N, time_step=ts, device=device,
+            data_dir=cfg['data_dir'], train=False, rnn=verifier,
+        )
+
+    # 每個 eps 只回傳這個 chunk 的 sample_times，由主程式聚合
+    partial = []  # list of (eps, [t0, t1, ...])
+    for eps in eps_values:
+        sample_times = []
+        for i in range(sample_start, sample_end):
+            X_i    = X[i:i+1]
+            top1_i = top1[i:i+1]
+            verifier.verify_robustness(X_i, eps)
+            start  = time.time()
+            compute_shap_ranking_once(verifier, X_i, top1_i, eps, P)
+            sample_times.append(time.time() - start)
+        partial.append((eps, sample_times))
+        print(f"[{dataset_name}] ts={ts} h={h} act={act} eps={eps:.3f} "
+              f"samples[{sample_start}:{sample_end}] done", flush=True)
+
+    return dataset_name, ts, h, act, partial
+
+
+if __name__ == "__main__":
+    import argparse
+    import numpy as np
+    import pandas as pd
+    from datetime import datetime
+    from multiprocessing import Pool
+    from collections import defaultdict
+    import multiprocessing as mp
+    import os, sys
+
+    def initialize_multiprocessing():
+        if sys.platform != 'win32':
+            try:
+                mp.set_start_method('spawn', force=True)
+                os.environ["OMP_NUM_THREADS"] = "1"
+                os.environ["MKL_NUM_THREADS"] = "1"
+            except RuntimeError:
+                pass
+
+    initialize_multiprocessing()
+
+    ALL_DATASETS = {
+        'cifar10':   {'timesteps': [8, 12, 24, 32],  'hidden_sizes': [16, 32, 64, 128], 'activations': ['relu', 'tanh']},
+        'mnist_seq': {'timesteps': [35, 40, 45, 50], 'hidden_sizes': [16, 32, 64, 128], 'activations': ['relu', 'tanh']},
     }
 
-    device = torch.device('cpu')
-    results = []
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset',    type=str, choices=list(ALL_DATASETS.keys()),
+                        default=None,   help='限定單一 dataset (不指定則跑全部)')
+    parser.add_argument('--timesteps',  type=int, nargs='+',
+                        default=None,   help='限定 timestep，例如 --timesteps 8 12')
+    parser.add_argument('--hidden_sizes', type=int, nargs='+',
+                        default=None,   help='限定 hidden_size，例如 --hidden_sizes 16 32')
+    parser.add_argument('--activations', type=str, nargs='+', choices=['relu', 'tanh'],
+                        default=None,   help='限定 activation，例如 --activations relu')
+    args = parser.parse_args()
 
-    combinations = list(itertools.product(
-        CONFIG['timesteps'],
-        CONFIG['eps_values'],
-        CONFIG['activations']
-    ))
+    WORKERS_PER_CONFIG = 4
+    N         = 50
+    P         = 2
+    EPS_VALUES = list(np.round(np.arange(0.005, 0.101, 0.001), 3))
 
-    print(f"\n{'='*60}")
-    print(f"SHAP Timing Benchmark")
-    print(f"{'='*60}")
-    print(f"Samples per config: {CONFIG['N']}")
-    print(f"Total configs: {len(combinations)}")
-    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*60}\n")
+    # 套用 CLI 過濾
+    datasets_to_run = {args.dataset: ALL_DATASETS[args.dataset]} if args.dataset else ALL_DATASETS
+    configs = [
+        (ds, ts, h, act)
+        for ds, cfg in datasets_to_run.items()
+        for ts  in (args.timesteps   or cfg['timesteps'])
+        for h   in (args.hidden_sizes or cfg['hidden_sizes'])
+        for act in (args.activations  or cfg['activations'])
+        if ts in cfg['timesteps'] and h in cfg['hidden_sizes']
+    ]
 
-    for ts, eps, act in combinations:
-        work_dir = f"{CONFIG['base_work_dir']}rnn_{ts}_{CONFIG['hidden_size']}_{act}/"
-        input_size = int(32 * 32 * 3 / ts)
-        
-        print(f"Config: ts={ts}, eps={eps}, act={act}", end=" ... ")
+    chunk = N // WORKERS_PER_CONFIG
 
-        verifier = ZeroSplitVerifier(
-            input_size, CONFIG['hidden_size'], 10, ts, act, max_splits=CONFIG['max_splits'][ts]
-        )
-        model_file = os.path.join(work_dir, "rnn")
-        
-        try:
-            verifier.load_state_dict(torch.load(model_file, map_location='cpu'))
-        except FileNotFoundError:
-            print("SKIP (model not found)")
-            continue
-            
-        verifier.to(device)
-        verifier.extractWeight(clear_original_model=False)
+    print(f"Total configs : {len(configs)}")
+    print(f"EPS values    : {EPS_VALUES[0]} ~ {EPS_VALUES[-1]} ({len(EPS_VALUES)} values)")
+    print(f"Started       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        X, y, top1 = sample_cifar10_data(
-            N=CONFIG['N'], time_step=ts, device=device,
-            data_dir=CONFIG['data_dir'], train=False, rnn=verifier
-        )
+    all_rows = []
+    for idx, (ds, ts, h, act) in enumerate(configs, 1):
+        print(f"\n[{idx}/{len(configs)}] {ds} ts={ts} h={h} act={act}")
 
-        sample_times = []
-        for i in range(CONFIG['N']):
-            X_i = X[i:i+1]
-            top1_i = top1[i:i+1]
-            
-            start = time.time()
-            _, _ = compute_shap_ranking_once(verifier, X_i, top1_i, eps, CONFIG['p'])
-            elapsed = time.time() - start
-            sample_times.append(elapsed)
+        sub_tasks = [
+            (ds, ts, h, act, EPS_VALUES, N, P,
+             j * chunk,
+             N if j == WORKERS_PER_CONFIG - 1 else (j + 1) * chunk)
+            for j in range(WORKERS_PER_CONFIG)
+        ]
 
-        avg_time = sum(sample_times) / len(sample_times)
-        std_time = (sum((t - avg_time)**2 for t in sample_times) / len(sample_times)) ** 0.5
-        
-        results.append({
-            'timestep': ts,
-            'eps': eps,
-            'activation': act,
-            'N': CONFIG['N'],
-            'avg_time': round(avg_time, 4),
-            'std_time': round(std_time, 4),
-            'min_time': round(min(sample_times), 4),
-            'max_time': round(max(sample_times), 4),
-        })
-        
-        print(f"avg={avg_time:.4f}s, std={std_time:.4f}s")
+        with Pool(WORKERS_PER_CONFIG) as pool:
+            results_list = pool.map(_shap_timing_worker, sub_tasks)
 
-    print(f"\n{'='*60}")
-    print("Results Summary")
-    print(f"{'='*60}")
-    
-    df = pd.DataFrame(results)
-    print(df.to_string(index=False))
-    
-    output_file = f"shap_timing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    df.to_excel(output_file, index=False)
-    print(f"\nSaved to: {output_file}")
+        # 聚合同一 config 的 4 份 partial times
+        aggregated = defaultdict(list)
+        for result in results_list:
+            if not result:
+                continue
+            _, _, _, _, partial = result
+            for eps, times in partial:
+                aggregated[eps].extend(times)
+
+        for eps, times in sorted(aggregated.items()):
+            avg_t = sum(times) / len(times)
+            std_t = (sum((t - avg_t) ** 2 for t in times) / len(times)) ** 0.5
+            all_rows.append({
+                'dataset':     ds,
+                'time_step':   ts,
+                'hidden_size': h,
+                'activation':  act,
+                'eps':         eps,
+                'N':           len(times),
+                'avg_time_s':  round(avg_t, 6),
+                'std_time_s':  round(std_t, 6),
+                'min_time_s':  round(min(times), 6),
+                'max_time_s':  round(max(times), 6),
+            })
+            print(f"  eps={eps:.3f}: avg={avg_t:.4f}s", flush=True)
+
+    if not all_rows:
+        print("No results collected.")
+    else:
+        df = pd.DataFrame(all_rows)
+        ds_tag = '_'.join(sorted(set(r['dataset']   for r in all_rows)))
+        ts_tag = '-'.join(str(t) for t in sorted(set(r['time_step'] for r in all_rows)))
+        out_file = (f"C:/Users/zxczx/POPQORN/vanilla_rnn/"
+                    f"shap_timing_{ds_tag}_ts{ts_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        df.to_excel(out_file, index=False)
+        print(f"\nSaved {len(all_rows)} rows to: {out_file}")

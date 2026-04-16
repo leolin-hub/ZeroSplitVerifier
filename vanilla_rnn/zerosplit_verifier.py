@@ -788,7 +788,8 @@ class ZeroSplitVerifier(RNN):
             # mid = (low + high) / 2 # bs
 
             # Phase 1: POPQORN
-            pq_verified, _, _, _ = self.verify_robustness(X, eps) # from mid to eps
+            with Timer(self.timing_stats, 'verify_robustness'):
+                pq_verified, _, _, _ = self.verify_robustness(X, eps) # from mid to eps
             
             # Save original bounds for recursive split
             self.original_l = [b.clone() if b is not None else None for b in self.l]
@@ -805,12 +806,13 @@ class ZeroSplitVerifier(RNN):
 
             # Phase 3: ZeroSplit refinement
             self._early_stop = False
-            result = self._recursive_split_verify(
-                X, eps, top1_tensor, p,
-                split_count=0, max_splits=max_splits,
-                start_timestep=1, refine_preh=None, mode=mode,
-                sample_id=sample_id, path=[], selected_neurons=selected_neurons # from mid to eps
-            )
+            with Timer(self.timing_stats, 'recursive_split_verify'):
+                result = self._recursive_split_verify(
+                    X, eps, top1_tensor, p,
+                    split_count=0, max_splits=max_splits,
+                    start_timestep=1, refine_preh=None, mode=mode,
+                    sample_id=sample_id, path=[], selected_neurons=selected_neurons # from mid to eps
+                )
             zs_verified = result['is_verified']
             last_result = result
 
@@ -1205,8 +1207,6 @@ class ZeroSplitVerifier(RNN):
         # 檢查全局提前終止標誌
         if self._early_stop:
             split_elapsed = time.time() - split_start_time
-            self.timing_stats.setdefault('recursive_split_verify', {'total': 0.0, 'count': 0})['total'] += split_elapsed
-            self.timing_stats['recursive_split_verify']['count'] += 1
             logger.info(f"  Sample {sample_id+1}: The verification has failed (split_count={split_count})")
             return {
                 'sample_id': sample_id,
@@ -1252,17 +1252,13 @@ class ZeroSplitVerifier(RNN):
                 )
 
         else:
-            with Timer(self.timing_stats, 'verify_robustness'):
-                _, _, yL_out, yU_out = self.verify_robustness(X, eps)
+            _, _, yL_out, yU_out = self.verify_robustness(X, eps)
 
         current_verified = self._check_region_robust(yL_out, yU_out, top1_class)
 
         if current_verified and split_count > 0:
             # 當前region驗證成功 -> 這是一個verified leaf node
             split_elapsed = time.time() - split_start_time
-            self.timing_stats.setdefault('recursive_split_verify', {'total': 0.0, 'count': 0})['total'] += split_elapsed
-            self.timing_stats['recursive_split_verify']['count'] += 1
-            # split_times.append((split_count, split_elapsed, sample_id))
 
             logger.info(f"  Sample {sample_id+1}: Current region VERIFIED at split_count={split_count}")
             return {
@@ -1322,9 +1318,6 @@ class ZeroSplitVerifier(RNN):
         if unsafe_layer is None:
             # 驗證失敗但找不到unsafe layer -> 無法繼續切分，這是一個unverified leaf node
             split_elapsed = time.time() - split_start_time
-            self.timing_stats.setdefault('recursive_split_verify', {'total': 0.0, 'count': 0})['total'] += split_elapsed
-            self.timing_stats['recursive_split_verify']['count'] += 1
-            # split_times.append((split_count, split_elapsed, sample_id))
 
             logger.info(f"  Sample {sample_id+1}: NOT verified and no unsafe layer found at split_count={split_count}, FAILED")
             return {
@@ -1386,8 +1379,6 @@ class ZeroSplitVerifier(RNN):
         }
 
         split_elapsed = time.time() - split_start_time
-        self.timing_stats.setdefault('recursive_split_verify', {'total': 0.0, 'count': 0})['total'] += split_elapsed
-        self.timing_stats['recursive_split_verify']['count'] += 1
         current_record = [(split_count + 1, split_elapsed, sample_id)]
         
         if mode == 'shap' and unsafe_layer is not None and unsafe_neuron is not None:
@@ -1940,13 +1931,13 @@ def main():
 
     parser = argparse.ArgumentParser(description='ZeroSplit Verifier for RNN robustness verification')
 
-    parser.add_argument('--hidden-size', default=2, type=int, metavar='HS',
+    parser.add_argument('--hidden-size', default=64, type=int, metavar='HS',
                         help='hidden layer size (default: 2)')
-    parser.add_argument('--time-step', default=2, type=int, metavar='TS',
+    parser.add_argument('--time-step', default=32, type=int, metavar='TS',
                         help='number of time steps (default: 2)')
     parser.add_argument('--activation', default='relu', type=str, metavar='A',
                         help='activation function: tanh or relu (default: relu)')
-    parser.add_argument('--work-dir', default='../models/mnist_classifier/rnn_1_2_relu/', type=str, metavar='WD',
+    parser.add_argument('--work-dir', default='../models/cifar10_classifier/rnn_32_64_relu/', type=str, metavar='WD',
                         help='directory with pretrained model')
     parser.add_argument('--model-name', default='rnn', type=str, metavar='MN',
                         help='pretrained model name (default: rnn)')
@@ -1956,14 +1947,14 @@ def main():
     parser.add_argument('--cuda-idx', default=0, type=int, metavar='CI',
                         help='GPU index (default: 0)')
 
-    parser.add_argument('--N', default=100, type=int,
+    parser.add_argument('--N', default=50, type=int,
                         help='number of samples (default: 5)')
     parser.add_argument('--p', default=2, type=int,
                         help='p norm (default: 2)')
     parser.add_argument('--eps', default=0.5, type=float,
                         help='perturbation epsilon (default: 0.5)')
-    parser.add_argument('--max-splits', default=3, type=int,
-                        help='maximum splits (default: 3)')
+    parser.add_argument('--max-splits', default=5, type=int,
+                        help='maximum splits (default: 5)')
     parser.add_argument('--merge-results', action='store_true',
                         help='merge split results')
     parser.add_argument('--debug', action='store_true',
