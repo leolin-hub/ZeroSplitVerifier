@@ -28,7 +28,8 @@ class LSTMNeuronLocator:
     (timestep, gate, neuron) 分割目標。
     """
 
-    def __init__(self, verifier, background_size=20, eps=None, p=2, top_k=3):
+    def __init__(self, verifier, background_size=20, eps=None, p=2, top_k=3,
+                 gate_filter=None):
         self.verifier = verifier
         self.background_size = background_size
         self.eps = eps
@@ -61,15 +62,10 @@ class LSTMNeuronLocator:
             if importance_per_gate is None:
                 continue
 
-            cross = self.verifier.detect_cross_zero(t)  # dict[gate -> BoolTensor]
-
             for g_idx, gate in enumerate(GATE_NAMES):
-                gate_cross = cross[gate]        # (batch, hidden)
                 gate_imp = importance_per_gate[g_idx]  # (hidden,)
-
                 for n in range(self.verifier.hidden_size):
-                    if gate_cross[:, n].any():
-                        candidates.append(((t, gate, n), round(float(gate_imp[n]), 6)))
+                    candidates.append(((t, gate, n), round(float(gate_imp[n]), 6)))
 
         candidates.sort(key=lambda x: x[1], reverse=True)
         candidates = candidates[:self.top_k]
@@ -93,13 +89,9 @@ class LSTMNeuronLocator:
         for (t, gate, n), importance in ranked:
             if (t, gate, n) in split_history:
                 continue
-
-            # 再次確認目前 bounds 下仍 cross-zero（bounds 可能因 split 而收緊）
-            cross = self.verifier.detect_cross_zero(t)
-            if cross[gate][:, n].any():
-                logger.info(f"  Selected split target: t={t}, gate={gate}, "
-                            f"n={n}, importance={importance:.4f}")
-                return t, gate, n
+            logger.info(f"  Selected split target: t={t}, gate={gate}, "
+                        f"n={n}, importance={importance:.4f}")
+            return t, gate, n
 
         logger.info("  No valid split target found.")
         return None, None, None

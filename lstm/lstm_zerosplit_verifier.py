@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 from loguru import logger
 from lstm import My_lstm
+from vanilla_rnn.utils.sample_cifar10_lstm import sample_cifar10_data
+from vanilla_rnn.utils.sample_data import sample_mnist_data
 
 
 GATE_NAMES = ['i', 'f', 'g', 'o']
@@ -42,15 +44,132 @@ class Timer:
         e['count'] += 1
 
 
+def _run_evr_sample(v, sample_id, x_i, p,
+                    eps_values, max_splits, eps_idx, background_size, top_k,
+                    gate_filter=None):
+    """
+    EVR 驗證主體。由 worker 在建立 verifier v 後呼叫。
+    對 LSTMZeroSplitVerifier 和 ReLULSTMZeroSplitVerifier 共用，避免程式碼重複。
+    """
+    import torch as _torch
+    from locate_neuron_lstm import LSTMNeuronLocator
+
+    with _torch.no_grad():
+        top1_i = v.get_final_output(x_i).argmax(dim=1)
+
+    v.sample_id = sample_id
+    last_result = None
+    sample_flag = 'pq_all_pass'
+    sample_eps  = eps_values[-1] if eps_values else 0.0
+
+    n_eps = len(eps_values)
+    for eps_step, eps in enumerate(eps_values, 1):
+        logger.info(f"[S{sample_id}] eps={eps:.6f} ({eps_step}/{n_eps})")
+        v.compute_all_bounds(eps, p, x_i, eps_idx)
+        pq_min, pq_max = v._get_output_bounds(eps, p, x_i, eps_idx)
+        pq_verified = v._is_verified(pq_min, pq_max, top1_i)
+
+        logger.info(f"[S{sample_id}] eps={eps:.6f} PQ={pq_verified}")
+
+        if pq_verified:
+            continue  # ZS not needed; scan next eps
+
+        # pq failed: run SHAP + ZeroSplit once then stop
+        locator = LSTMNeuronLocator(v, background_size=background_size,
+                                    eps=eps, p=p, top_k=top_k,
+                                    gate_filter=gate_filter)
+        ranked = locator.compute_ranking(x_i, top1_i)
+
+        v._pq_min = pq_min
+        v._pq_max = pq_max
+        v._leaf_margins = []
+        _t0 = time.perf_counter()
+        zs_verified = v._evr_recursive(
+            eps, p, x_i, top1_i, eps_idx,
+            depth=0, split_history=set(),
+            max_splits=max_splits, locator=locator, ranked=ranked,
+        )
+        _e = v.timing_stats.setdefault('zs_total', {'total_sec': 0.0, 'count': 0})
+        _e['total_sec'] += time.perf_counter() - _t0
+        _e['count'] += 1
+
+        L_val = int(top1_i[0].item())
+        mask_val = _torch.arange(pq_max.shape[1]) != L_val
+        pq_margin_val = (pq_min[0, L_val] - pq_max[0][mask_val].max()).item()
+        zs_margin_val = min(v._leaf_margins) if v._leaf_margins else None
+        gain_val = (zs_margin_val - pq_margin_val) if zs_margin_val is not None else None
+
+        last_result = {
+            'eps': eps,
+            'pq_verified': pq_verified,
+            'zs_verified': zs_verified,
+            'pq_margin': round(pq_margin_val, 6),
+            'zs_margin': round(zs_margin_val, 6) if zs_margin_val is not None else None,
+            'gain': round(gain_val, 6) if gain_val is not None else None,
+        }
+
+        logger.info(
+            f"[S{sample_id}] eps={eps:.6f} "
+            f"PQ={pq_verified} ZS={zs_verified} "
+            f"pq_margin={pq_margin_val:.6f} zs_margin={zs_margin_val}"
+        )
+
+        sample_eps  = eps
+        if zs_verified:
+            sample_flag = 'zs_better'
+            break  # ZS rescued; stop scanning
+        else:
+            sample_flag = 'both_fail'
+            # continue to next eps
+
+    return sample_id, sample_flag, sample_eps, last_result, v.timing_stats
+
+
 class LSTMZeroSplitVerifier(My_lstm):
 
     def __init__(self, net, device, WF=None, bF=None, seq_len=None,
-                 a0=None, c0=None, max_splits=1, debug=False):
+                 a0=None, c0=None, max_splits=1, debug=False, lut_dir=None):
         My_lstm.__init__(self, net, device, WF, bF, seq_len, a0, c0)
         self.max_splits = max_splits
         self.debug = debug
         self.split_count = 0
         self.timing_stats = {}
+        self._lut_dir = lut_dir
+        self._luts = {}
+        if lut_dir is not None:
+            self._load_luts(lut_dir)
+
+    # ------------------------------------------------------------------
+    # LUT helpers: optimal branching point lookup
+    # ------------------------------------------------------------------
+
+    def _load_luts(self, lut_dir: str) -> None:
+        """載入 pre-computed branching point lookup tables（pkl）。"""
+        from branching_point_optimizer import load_lookup_table
+        for act in ('relu', 'sigmoid', 'tanh'):
+            path = os.path.join(lut_dir, f'{act}_lookup.pkl')
+            if os.path.exists(path):
+                self._luts[act] = load_lookup_table(path)
+                logger.info(f'Loaded {act} LUT from {path}')
+
+    def _gate_activation(self, gate: str) -> str:
+        """gate name → activation function name（供 LUT 查表）。"""
+        return 'tanh' if gate == 'g' else 'sigmoid'
+
+    def _lookup_split_point(self, gate: str, l: float, u: float) -> float:
+        """
+        查 LUT 取最優分割點 p*。
+        無 LUT 或 p* 不在 (l, u) 內時 fallback 到中點。
+        """
+        mid = (l + u) / 2.0
+        if not self._luts:
+            return mid
+        lut = self._luts.get(self._gate_activation(gate))
+        if lut is None:
+            return mid
+        from branching_point_optimizer import query_lookup_table_1d
+        p_opt = query_lookup_table_1d(lut, l, u)
+        return p_opt if (l < p_opt < u) else mid
 
     # ------------------------------------------------------------------
     # Step 1: bound computation
@@ -142,19 +261,19 @@ class LSTMZeroSplitVerifier(My_lstm):
             self.get_Wa_b(W_eye, 0, k, x, eps, p, save_a=True, eps_idx=eps_idx)
 
     def _apply_split(self, gate_l, gate_u, t, n, orig_l, orig_u, side,
-                     eps, p, x, eps_idx):
+                     eps, p, x, eps_idx, split_point=0.0):
         """
         將 gate 還原到 orig，套用單側 clamp，再從 timestep t 重算所有 bounds。
-        side='neg' → gate_u[:,n] clamp ≤ 0  (gate 只能負值)
-        side='pos' → gate_l[:,n] clamp ≥ 0  (gate 只能正值)
-        每次進入新的 branch 前都從 orig 重設，確保不受另一 branch 殘留影響。
+        side='neg' → gate_u[:,n] clamp ≤ split_point
+        side='pos' → gate_l[:,n] clamp ≥ split_point
+        split_point 預設 0.0（ZeroSplit 原語意）；有 LUT 時由呼叫方傳入 p*。
         """
         gate_l[t-1] = orig_l.clone()
         gate_u[t-1] = orig_u.clone()
         if side == 'neg':
-            gate_u[t-1][:, n].clamp_(max=0.0)
+            gate_u[t-1][:, n].clamp_(max=split_point)
         else:
-            gate_l[t-1][:, n].clamp_(min=0.0)
+            gate_l[t-1][:, n].clamp_(min=split_point)
         self._recompute_from(t, eps, p, x, eps_idx)
 
     def _restore_gate(self, gate_l, gate_u, t, orig_l, orig_u):
@@ -206,25 +325,24 @@ class LSTMZeroSplitVerifier(My_lstm):
             'WF':      self.W.detach().cpu(),
             'bF':      self.b.detach().cpu(),
             'seq_len': self.seq_len,
+            'lut_dir': self._lut_dir,
         }
 
     @staticmethod
     def _process_single_sample_worker(args):
-        """Worker：建立獨立 verifier 對單一樣本執行完整 EVR 流程。"""
-        (sample_id, x_i, y_i, model_state, p,
+        """Worker：建立獨立 LSTMZeroSplitVerifier 對單一樣本執行完整 EVR 流程。"""
+        (sample_id, x_i, model_state, p,
          eps_values, max_splits, eps_idx,
-         background_size, top_k) = args
+         background_size, top_k, gate_filter) = args
 
-        # 確保 worker process 能 import 同目錄的模組
         import os, sys
         _dir = os.path.dirname(os.path.abspath(__file__))
         sys.path.insert(0, os.path.join(_dir, '..'))
         sys.path.insert(0, _dir)
 
         import torch
-        from locate_neuron_lstm import LSTMNeuronLocator
+        from lstm_zerosplit_verifier import LSTMZeroSplitVerifier, _run_evr_sample
 
-        # 用 dict 重建一個輕量 _Net 殼
         class _Net: pass
         net = _Net()
         net.input_size   = model_state['input_size']
@@ -238,64 +356,15 @@ class LSTMZeroSplitVerifier(My_lstm):
             net, torch.device('cpu'),
             WF=model_state['WF'], bF=model_state['bF'],
             seq_len=model_state['seq_len'], max_splits=max_splits,
+            lut_dir=model_state.get('lut_dir'),
         )
-        v.sample_id = sample_id
+        return _run_evr_sample(v, sample_id, x_i, p,
+                               eps_values, max_splits, eps_idx, background_size, top_k,
+                               gate_filter=gate_filter)
 
-        last_result = None
-        sample_flag = 'equal'
-        sample_eps  = eps_values[-1] if eps_values else 0.0
-
-        for eps in eps_values:
-            v.compute_all_bounds(eps, p, x_i, eps_idx)
-            pq_min, pq_max = v._get_output_bounds(eps, p, x_i, eps_idx)
-            pq_verified = v._is_verified(pq_min, pq_max, y_i)
-
-            locator = LSTMNeuronLocator(v, background_size=background_size,
-                                        eps=eps, p=p, top_k=top_k)
-            ranked = locator.compute_ranking(x_i, y_i)
-
-            v._pq_min = pq_min
-            v._pq_max = pq_max
-            v._leaf_margins = []
-            _t0 = time.perf_counter()
-            zs_verified = v._evr_recursive(
-                eps, p, x_i, y_i, eps_idx,
-                depth=0, split_history=set(),
-                max_splits=max_splits, locator=locator, ranked=ranked,
-            )
-            _e = v.timing_stats.setdefault('zs_total', {'total_sec': 0.0, 'count': 0})
-            _e['total_sec'] += time.perf_counter() - _t0
-            _e['count'] += 1
-
-            L_val = int(y_i[0].item())
-            mask_val = torch.arange(pq_max.shape[1]) != L_val
-            pq_margin_val = (pq_min[0, L_val] - pq_max[0][mask_val].max()).item()
-            zs_margin_val = min(v._leaf_margins) if v._leaf_margins else None
-            gain_val = (zs_margin_val - pq_margin_val) if zs_margin_val is not None else None
-
-            last_result = {
-                'eps': eps,
-                'pq_verified': pq_verified,
-                'zs_verified': zs_verified,
-                'pq_margin': round(pq_margin_val, 6),
-                'zs_margin': round(zs_margin_val, 6) if zs_margin_val is not None else None,
-                'gain': round(gain_val, 6) if gain_val is not None else None,
-            }
-
-            if not pq_verified and zs_verified:
-                sample_flag = 'zs_better'
-                sample_eps  = eps
-                break
-            if pq_verified and not zs_verified:
-                sample_flag = 'pq_better'
-                sample_eps  = eps
-                break
-
-        return sample_id, sample_flag, sample_eps, last_result, v.timing_stats
-
-    def verify_evr(self, X, true_label, p, eps_range, precision=0.001,
+    def verify_evr(self, X, p, eps_range, precision=0.001,
                    max_splits=None, eps_idx=None, background_size=20, top_k=5,
-                   n_workers=None, save_dir=None):
+                   n_workers=None, save_dir=None, gate_filter=None):
         """
         對每個樣本逐一執行 eps_range 內的驗證流程：
           1. POPQORN：compute_all_bounds → pq_verified
@@ -306,7 +375,6 @@ class LSTMZeroSplitVerifier(My_lstm):
 
         Args:
             X:              (N, seq_len, input_size)
-            true_label:     (N,) ground-truth labels
             p:              lp-norm
             eps_range:      (eps_min, eps_max)
             precision:      eps step size
@@ -339,18 +407,17 @@ class LSTMZeroSplitVerifier(My_lstm):
         eps_idx_cpu = eps_idx.cpu()
 
         worker_args = [
-            (i, X[i:i+1].cpu(), true_label[i:i+1].cpu(), model_state, p,
-             eps_values, max_splits, eps_idx_cpu, background_size, top_k)
+            (i, X[i:i+1].cpu(), model_state, p,
+             eps_values, max_splits, eps_idx_cpu, background_size, top_k, gate_filter)
             for i in range(X.shape[0])
         ]
 
+        _worker = type(self)._process_single_sample_worker
         if n_workers > 1:
             with mp.Pool(processes=n_workers) as pool:
-                raw = pool.map(LSTMZeroSplitVerifier._process_single_sample_worker,
-                               worker_args)
+                raw = pool.map(_worker, worker_args)
         else:
-            raw = [LSTMZeroSplitVerifier._process_single_sample_worker(a)
-                   for a in worker_args]
+            raw = [_worker(a) for a in worker_args]
 
         raw.sort(key=lambda x: x[0])
 
@@ -447,10 +514,15 @@ class LSTMZeroSplitVerifier(My_lstm):
         orig_l = gate_l[t-1].clone()
         orig_u = gate_u[t-1].clone()
 
-        # --- neg branch: gate ≤ 0 ---
-        logger.info(f"  [S{sid}] depth={depth} neg: t={t}, gate={gate}[{n}] u→clamp(0)")
+        # 查 LUT 取最優分割點（無 LUT 時 fallback 到 0.0）
+        l_val = float(orig_l[0, n].item())
+        u_val = float(orig_u[0, n].item())
+        split_point = self._lookup_split_point(gate, l_val, u_val)
+
+        # --- neg branch: gate ≤ split_point ---
+        logger.info(f"  [S{sid}|eps={eps:.5f}] depth={depth} neg: t={t}, gate={gate}[{n}] u→clamp({split_point:.4f})")
         self._apply_split(gate_l, gate_u, t, n, orig_l, orig_u, side='neg',
-                          eps=eps, p=p, x=x, eps_idx=eps_idx)
+                          eps=eps, p=p, x=x, eps_idx=eps_idx, split_point=split_point)
         neg_ok = self._evr_recursive(eps, p, x, true_label, eps_idx,
                                      depth + 1, new_history,
                                      max_splits, locator, ranked)
@@ -460,13 +532,13 @@ class LSTMZeroSplitVerifier(My_lstm):
             # 只還原 gate 值；parent 的 _recompute_from 會重算後續所有 bounds，
             # 所以這裡不需要額外呼叫 _recompute_from。
             self._restore_gate(gate_l, gate_u, t, orig_l, orig_u)
-            logger.info(f"  [S{sid}] depth={depth} neg failed → skip pos, propagate False")
+            logger.info(f"  [S{sid}|eps={eps:.5f}] depth={depth} neg failed → skip pos, propagate False")
             return False
 
-        # --- pos branch: gate ≥ 0 ---
-        logger.info(f"  [S{sid}] depth={depth} pos: t={t}, gate={gate}[{n}] l→clamp(0)")
+        # --- pos branch: gate ≥ split_point ---
+        logger.info(f"  [S{sid}|eps={eps:.5f}] depth={depth} pos: t={t}, gate={gate}[{n}] l→clamp({split_point:.4f})")
         self._apply_split(gate_l, gate_u, t, n, orig_l, orig_u, side='pos',
-                          eps=eps, p=p, x=x, eps_idx=eps_idx)
+                          eps=eps, p=p, x=x, eps_idx=eps_idx, split_point=split_point)
         pos_ok = self._evr_recursive(eps, p, x, true_label, eps_idx,
                                      depth + 1, new_history,
                                      max_splits, locator, ranked)
@@ -474,9 +546,100 @@ class LSTMZeroSplitVerifier(My_lstm):
         # --- restore original gate + recompute（此層的 split 已處理完畢）---
         self._restore_gate(gate_l, gate_u, t, orig_l, orig_u)
         self._recompute_from(t, eps, p, x, eps_idx)
-        logger.info(f"  [S{sid}] depth={depth} done: neg={neg_ok} pos={pos_ok} → {pos_ok}")
+        logger.info(f"  [S{sid}|eps={eps:.5f}] depth={depth} done: neg={neg_ok} pos={pos_ok} → {pos_ok}")
 
         return pos_ok  # neg_ok is True here
+
+
+# ------------------------------------------------------------------
+# ReLU-LSTM ZeroSplit Verifier
+# ------------------------------------------------------------------
+
+class ReLULSTMZeroSplitVerifier(LSTMZeroSplitVerifier):
+    """
+    ZeroSplit verifier for ReLU-LSTM:
+        g gate : relu(yg)   instead of tanh(yg)
+        output : σ(yo)*c    instead of σ(yo)*tanh(c)
+
+    Inherits all bound-propagation and ZeroSplit logic from
+    LSTMZeroSplitVerifier; overrides forward/get_hig/get_hoc via
+    My_relu_lstm through __init__.
+    """
+
+    def __init__(self, net, device, WF=None, bF=None, seq_len=None,
+                 a0=None, c0=None, max_splits=1, debug=False, lut_dir=None):
+        from lstm_relu import My_relu_lstm
+        # Initialise with My_relu_lstm's __init__ (reads weights from net)
+        My_relu_lstm.__init__(self, net, device, WF, bF, seq_len, a0, c0)
+        self.max_splits  = max_splits
+        self.debug       = debug
+        self.split_count = 0
+        self.timing_stats = {}
+        self._lut_dir = lut_dir
+        self._luts = {}
+        if lut_dir is not None:
+            self._load_luts(lut_dir)
+
+    def _gate_activation(self, gate: str) -> str:
+        """ReLU-LSTM: g gate 用 relu，其餘 sigmoid。"""
+        return 'relu' if gate == 'g' else 'sigmoid'
+
+    # Override get_hig/get_hoc/forward come from My_relu_lstm via MRO
+    # (My_relu_lstm is in the MRO because __init__ calls it directly).
+    # We patch the class-level method lookup so Python's attribute resolution
+    # finds My_relu_lstm's overrides.  The easiest way is explicit delegation.
+
+    def get_hig(self, m):
+        from lstm_relu import My_relu_lstm
+        return My_relu_lstm.get_hig(self, m)
+
+    def get_hoc(self, m):
+        from lstm_relu import My_relu_lstm
+        return My_relu_lstm.get_hoc(self, m)
+
+    def forward(self, x, a0=None, c0=None, use_x_seq_len=False):
+        from lstm_relu import My_relu_lstm
+        return My_relu_lstm.forward(self, x, a0=a0, c0=c0,
+                                    use_x_seq_len=use_x_seq_len)
+
+    def _build_model_state(self):
+        state = super()._build_model_state()
+        state['relu'] = True
+        return state
+
+    @staticmethod
+    def _process_single_sample_worker(args):
+        """Worker：建立獨立 ReLULSTMZeroSplitVerifier 對單一樣本執行完整 EVR 流程。"""
+        (sample_id, x_i, model_state, p,
+         eps_values, max_splits, eps_idx,
+         background_size, top_k, gate_filter) = args
+
+        import os, sys
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, os.path.join(_dir, '..'))
+        sys.path.insert(0, _dir)
+
+        import torch
+        from lstm_zerosplit_verifier import ReLULSTMZeroSplitVerifier, _run_evr_sample
+
+        class _Net: pass
+        net = _Net()
+        net.input_size   = model_state['input_size']
+        net.hidden_size  = model_state['hidden_size']
+        net.weight_ih_l0 = model_state['weight_ih_l0']
+        net.weight_hh_l0 = model_state['weight_hh_l0']
+        net.bias_ih_l0   = model_state['bias_ih_l0']
+        net.bias_hh_l0   = model_state['bias_hh_l0']
+
+        v = ReLULSTMZeroSplitVerifier(
+            net, torch.device('cpu'),
+            WF=model_state['WF'], bF=model_state['bF'],
+            seq_len=model_state['seq_len'], max_splits=max_splits,
+            lut_dir=model_state.get('lut_dir'),
+        )
+        return _run_evr_sample(v, sample_id, x_i, p,
+                               eps_values, max_splits, eps_idx, background_size, top_k,
+                               gate_filter=gate_filter)
 
 
 # ------------------------------------------------------------------
@@ -496,9 +659,9 @@ def _write_evr_json(save_dir, sample_records, agg_timing, eps_range,
              f'_N{N}_splits{max_splits}.json')
     path = session_dir / fname
 
-    zs_better = sum(1 for r in sample_records if r['flag'] == 'zs_better')
-    pq_better  = sum(1 for r in sample_records if r['flag'] == 'pq_better')
-    equal      = sum(1 for r in sample_records if r['flag'] == 'equal')
+    zs_better   = sum(1 for r in sample_records if r['flag'] == 'zs_better')
+    both_fail   = sum(1 for r in sample_records if r['flag'] == 'both_fail')
+    pq_all_pass = sum(1 for r in sample_records if r['flag'] == 'pq_all_pass')
 
     data = {
         'experiment_info': {
@@ -512,9 +675,9 @@ def _write_evr_json(save_dir, sample_records, agg_timing, eps_range,
             'N_samples':   len(sample_records),
         },
         'evr_summary': {
-            'zs_better': zs_better,
-            'pq_better': pq_better,
-            'equal':     equal,
+            'zs_better':   zs_better,
+            'both_fail':   both_fail,
+            'pq_all_pass': pq_all_pass,
         },
         'sample_records': sample_records,
         'timing_stats': {
@@ -556,23 +719,41 @@ class LSTMClassifier(nn.Module):
 # __main__: sample data → load weights → compute output bounds
 # ------------------------------------------------------------------
 
+DATASET_REGISTRY = {
+    'cifar10': {
+        'total_dim': lambda args: 3072 if args.use_rgb else 1024,
+        'sample':    lambda args, time_step, device, model:
+                         sample_cifar10_data(N=args.N, time_step=time_step, device=device,
+                                             data_dir=args.data_dir, train=False,
+                                             use_rgb=args.use_rgb, shuffle=True, rnn=model),
+    },
+    'mnist': {
+        'total_dim': lambda args: 784,
+        'sample':    lambda args, time_step, device, model:
+                         sample_mnist_data(N=args.N, seq_len=time_step, device=device,
+                                           data_dir=args.data_dir, train=False,
+                                           shuffle=True, rnn=model),
+    },
+}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='LSTM ZeroSplit Verifier — EVR verification'
     )
     parser.add_argument('--hidden-size', default=64, type=int, metavar='HS',
                         help='hidden layer size (default: 32)')
-    parser.add_argument('--time-step', default=8, type=int, metavar='TS',
+    parser.add_argument('--time-step', default=4, type=int, metavar='TS',
                         help='sequence length / time steps (default: 8)')
-    parser.add_argument('--use-rgb', default=True, type=bool,
-                        help='use RGB (3072) or grayscale (1024) (default: True)')
+    parser.add_argument('--use-rgb', action='store_true',
+                        help='use RGB (3072) instead of grayscale (1024)')
     parser.add_argument('--work-dir',
-                        default='../models/cifar10_lstm/',
+                        default='../models/mnist_lstm/',
                         type=str, metavar='WD',
                         help='directory containing the pretrained model')
     parser.add_argument('--cuda', action='store_true',
                         help='use GPU if available')
-    parser.add_argument('--N', default=10, type=int,
+    parser.add_argument('--N', default=50, type=int,
                         help='number of test samples (default: 5)')
     parser.add_argument('--p', default=2, type=int,
                         help='lp-norm; p > 100 is treated as inf (default: 2)')
@@ -580,7 +761,7 @@ def main():
                         help='perturbation radius (default: 0.005)')
     parser.add_argument('--eps-min', default=0.005, type=float,
                         help='eps range lower bound for verify_evr (default: 0.001)')
-    parser.add_argument('--eps-max', default=0.005, type=float,
+    parser.add_argument('--eps-max', default=0.02, type=float,
                         help='eps range upper bound for verify_evr (default: 0.01)')
     parser.add_argument('--max-splits', default=5, type=int,
                         help='max ZeroSplit iterations (default: 5)')
@@ -588,8 +769,17 @@ def main():
                         help='number of parallel worker processes (default: auto = cpu_count)')
     parser.add_argument('--save-dir', default='./lstm/evr_results', type=str,
                         help='directory to write EVR JSON results (default: None, no save)')
+    parser.add_argument('--dataset', default='mnist', choices=list(DATASET_REGISTRY),
+                        help='dataset: cifar10 | mnist (default: cifar10)')
     parser.add_argument('--data-dir', default='./data', type=str,
-                        help='CIFAR-10 data directory (default: ./data)')
+                        help='data directory (default: ./data)')
+    parser.add_argument('--relu', action='store_true',
+                        help='use ReLU-LSTM verifier (relu(yg), identity output)')
+    parser.add_argument('--gate-filter', default=None, type=str,
+                        help='comma-separated gates to split on, e.g. "g" or "g,i" (default: all gates)')
+    parser.add_argument('--lut-dir', default=None, type=str,
+                        help='directory with pre-built branching point LUTs; '
+                             'if omitted, ZeroSplit falls back to p=0 (original behaviour)')
     args = parser.parse_args()
 
     device = torch.device(
@@ -598,42 +788,57 @@ def main():
     p = args.p if args.p <= 100 else float('inf')
     time_step   = args.time_step
     hidden_size = args.hidden_size
-    total_dim   = 3072 if args.use_rgb else 1024
-    input_size  = total_dim // time_step
+    cfg        = DATASET_REGISTRY[args.dataset]
+    total_dim  = cfg['total_dim'](args)
+    input_size = total_dim // time_step
     output_size = 10
 
-    model = LSTMClassifier(input_size, hidden_size, output_size)
-    model_path = os.path.join(args.work_dir, f'lstm_{time_step}_{hidden_size}', 'lstm')
+    if args.relu:
+        from lstm_relu import My_relu_lstm
+        from train_mnist_relu_lstm import ReLULSTMClassifier
+        model = ReLULSTMClassifier(input_size, hidden_size, output_size, dropout=0.0)
+        model_path = os.path.join(args.work_dir,
+                                  f'relu_lstm_{time_step}_{hidden_size}', 'relu_lstm')
+    else:
+        model = LSTMClassifier(input_size, hidden_size, output_size)
+        model_path = os.path.join(args.work_dir,
+                                  f'lstm_{time_step}_{hidden_size}', 'lstm')
+
     model.load_state_dict(torch.load(model_path, map_location='cpu'))
     model.to(device)
     logger.info(f'Loaded model from {model_path}')
 
-    from vanilla_rnn.utils.sample_cifar10_lstm import sample_cifar10_data
+    X, _, _ = cfg['sample'](args, time_step, device, model)
+    logger.info(f'Sampled {X.shape[0]} {args.dataset} samples (shape {list(X.shape)})')
 
-    X, y, _ = sample_cifar10_data(
-        N=args.N, time_step=time_step, device=device,
-        data_dir=args.data_dir, train=False, use_rgb=args.use_rgb,
-        shuffle=True, rnn=model
-    )
-    logger.info(f'Sampled {X.shape[0]} CIFAR-10 samples (shape {list(X.shape)})')
-    logger.info(f'True labels: {y.tolist()}')
-
-    verifier = LSTMZeroSplitVerifier(
-        model.rnn, device,
-        WF=model.fc.weight, bF=model.fc.bias,
-        seq_len=time_step, max_splits=args.max_splits
-    )
+    if args.relu:
+        verifier = ReLULSTMZeroSplitVerifier(
+            model.rnn, device,
+            WF=model.fc.weight, bF=model.fc.bias,
+            seq_len=time_step, max_splits=args.max_splits,
+            lut_dir=args.lut_dir,
+        )
+    else:
+        verifier = LSTMZeroSplitVerifier(
+            model.rnn, device,
+            WF=model.fc.weight, bF=model.fc.bias,
+            seq_len=time_step, max_splits=args.max_splits,
+            lut_dir=args.lut_dir,
+        )
 
     eps_idx = torch.ones(time_step, device=device)
 
-    logger.info(f'\nRunning verify_evr (eps_range=({args.eps_min}, {args.eps_max}), p={p}, max_splits={args.max_splits}) ...')
+    gate_filter = set(args.gate_filter.split(',')) if args.gate_filter else None
+
+    logger.info(f'\nRunning verify_evr (eps_range=({args.eps_min}, {args.eps_max}), p={p}, max_splits={args.max_splits}, gate_filter={gate_filter}) ...')
     results = verifier.verify_evr(
-        X, y, p,
+        X, p,
         eps_range=(args.eps_min, args.eps_max),
         max_splits=args.max_splits,
         eps_idx=eps_idx,
         n_workers=args.n_workers,
         save_dir=args.save_dir,
+        gate_filter=gate_filter,
     )
 
 
