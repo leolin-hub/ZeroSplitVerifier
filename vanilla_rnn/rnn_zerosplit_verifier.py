@@ -849,7 +849,7 @@ DATASET_REGISTRY = {
         'input_size': lambda args: 3,
         'sample': lambda args, verifier, device: sample_seq_mnist_data(
             N=args.N, time_step=args.time_step, device=device,
-            data_dir='./data/mnist_seq/sequences/', train=False, rnn=verifier,
+            data_dir=args.data_dir, train=False, rnn=verifier,
         ),
     },
     'cifar10': {
