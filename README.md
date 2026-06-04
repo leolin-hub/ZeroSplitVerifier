@@ -77,22 +77,20 @@ conda activate torch-env
 pip install torch torchvision shap loguru tqdm
 ```
 
-Replace `python` with the full path to your environment's interpreter as needed.
-
 ---
 
-## 環境與執行慣例
+## Environment & Conventions
 
-- Python 環境：conda `torch-env`。兩種用法擇一：
-  - 先啟動：`conda activate torch-env`（tmux 多 window 並行建議採此）
-  - 直接指定：`$PYTHON_BIN` 環境變數（見下）
-- **所有指令從 repo 根目錄執行**（auto_test 腳本以相對路徑呼叫 verifier，cwd 須是 repo 根）
+- Python environment: conda `torch-env`. Two usage patterns:
+  - Activate first: `conda activate torch-env` (recommended for tmux multi-window parallelism)
+  - Direct path: set `PYTHON_BIN` environment variable (see below)
+- **Run all commands from the repo root** — `auto_test_*.py` scripts invoke verifiers via relative paths, so the working directory must be the repo root.
 
-> `auto_test_*.py` 支援兩個環境變數覆寫：
-> - `PYTHON_BIN`：指定 Python 直譯器路徑，預設 `sys.executable`（當前環境）
-> - `MODEL_ROOT`：模型根目錄，預設 `../models`
+> `auto_test_*.py` supports two environment variable overrides:
+> - `PYTHON_BIN`: path to the Python interpreter, defaults to `sys.executable` (current environment)
+> - `MODEL_ROOT`: model root directory, defaults to `../models`
 >
-> 範例：`MODEL_ROOT=/home/user/models PYTHON_BIN=/path/to/python python vanilla_rnn/auto_test_zs_mnist.py`
+> Example: `MODEL_ROOT=/home/user/models PYTHON_BIN=/path/to/python python vanilla_rnn/auto_test_zs_mnist.py`
 
 ---
 
@@ -182,29 +180,29 @@ python vanilla_rnn/rnn_zerosplit_verifier.py --toy-rnn --max-splits 2
 
 ---
 
-## 批次掃描（Auto Test）
+## Batch Scanning (Auto Test)
 
-每條實驗線都是「核心 verifier + 外層 auto_test 掃描器」。每個 `auto_test_*.py` 支援：
-- `--timestep N`：只跑這個 timestep（tmux 多 window 並行設計）
-- `--resume`：從最新 `auto_test_results_*/progress.json` 跳過已完成項
+Each experiment line consists of a core verifier plus an outer `auto_test` driver that sweeps over parameter grids. Every `auto_test_*.py` supports:
+- `--timestep N`: run only this timestep (designed for tmux multi-window parallelism)
+- `--resume`: skip already-completed runs from the latest `auto_test_results_*/progress.json`
 
 ### Vanilla RNN
 
-| 資料集 | 腳本 | timesteps | hidden |
-|--------|------|-----------|--------|
-| MNIST | `vanilla_rnn/auto_test_zs_mnist.py` | 1,2,4,7 | 4,8,16,32 |
-| MNIST sequential | `vanilla_rnn/auto_test_seq.py` | 50 | 16,32,64,128 |
-| CIFAR-10 | `vanilla_rnn/auto_test_cifar10.py` | 8 | 16,32,64,128 |
+| Dataset | Script | Timesteps | Hidden sizes |
+|---------|--------|-----------|--------------|
+| MNIST | `vanilla_rnn/auto_test_zs_mnist.py` | 1, 2, 4, 7 | 4, 8, 16, 32 |
+| MNIST sequential | `vanilla_rnn/auto_test_seq.py` | 50 | 16, 32, 64, 128 |
+| CIFAR-10 | `vanilla_rnn/auto_test_cifar10.py` | 8 | 16, 32, 64, 128 |
 
-### LSTM（MNIST）
+### LSTM (MNIST)
 
 ```bash
 python lstm/auto_test_mnist_lstm.py --timestep {1,2,4,7}
 ```
 
-hidden `[4,8,16,32]` × timesteps `[1,2,4,7]`，eps 0.01–0.3
+hidden `[4, 8, 16, 32]` × timesteps `[1, 2, 4, 7]`, eps range 0.01–0.3
 
-### tmux 四 window 並行
+### tmux Four-Window Parallelism
 
 ```bash
 conda activate torch-env
@@ -217,20 +215,20 @@ tmux send-keys -t rnn:3 "python vanilla_rnn/auto_test_zs_mnist.py --timestep 7" 
 tmux attach -t rnn
 ```
 
-> 4 window × `--n-workers 4` = 16 個 process，請依 CPU 核心數調整。
+> ⚠️ Each window runs `--n-workers 4` internally; 4 windows × 4 workers = 16 processes. Adjust based on available CPU cores.
 
 ---
 
-## 結果解析
+## Result Parsing
 
-每個 verifier 跑完在 `--save-dir` 下寫 JSON（含 `experiment_info`、`evr_summary`、`timing_stats`、`sample_records`）：
-- RNN：`evr_results/session_rnn_{act}_hidden{hs}_ts{ts}_p{p}/evr_rnn_*.json`
-- LSTM：`lstm/evr_results/session_lstm_hidden{hs}_ts{ts}_p{p}/evr_lstm_*.json`
+Each verifier run writes a JSON file under `--save-dir` containing `experiment_info`, `evr_summary`, `timing_stats`, and `sample_records`:
+- RNN: `evr_results/session_rnn_{act}_hidden{hs}_ts{ts}_p{p}/evr_rnn_*.json`
+- LSTM: `lstm/evr_results/session_lstm_hidden{hs}_ts{ts}_p{p}/evr_lstm_*.json`
 
-**解析成 Excel**：
+**Export to Excel:**
 
 ```bash
-python vanilla_rnn/parse_evr.py          # RNN（路徑寫在 __main__）
+python vanilla_rnn/parse_evr.py          # RNN (paths configured in __main__)
 python lstm/parse_evr_lstm.py --input-dir ./lstm/evr_results --output evr_lstm_summary.xlsx
 ```
 
@@ -246,20 +244,20 @@ python lstm/parse_evr_lstm.py --input-dir ./lstm/evr_results --output evr_lstm_s
 
 ---
 
-## 附錄：GenBaB（α,β-CROWN）比較
+## Appendix: GenBaB (α,β-CROWN) Comparison
 
-比較對象：LSTM on MNIST，hidden `[4,8,16,32]` × timestep `[1,2,4,7]`，N=50，L2 norm，CPU only。
-GenBaB 安裝在獨立 repo（非本 repo 範圍）；橋接腳本在 `lstm/`：
+Comparison target: LSTM on MNIST, hidden `[4, 8, 16, 32]` × timestep `[1, 2, 4, 7]`, N=50, L2 norm, CPU only.
+GenBaB lives in a separate repo (not tracked here); bridge scripts in `lstm/`:
 
-| 腳本 | 用途 |
-|------|------|
-| `lstm/save_test_samples.py` | 以 seed=2025 抽樣，存共用樣本（確保兩邊測同一批）|
-| `lstm/export_relu_lstm_onnx.py` | 匯出 ONNX（FlatWrapper 預切 gate 權重，不需 onnxsim）|
-| `lstm/create_genbab_configs.py` | 產生 GenBaB yaml config |
-| `lstm/auto_test_genbab_mnist.py` | 呼叫 α,β-CROWN 掃描，收集 wall-clock 計時 |
-| `lstm/parse_genbab_results.py` | 解析結果成 `lstm/genbab_results.xlsx` |
+| Script | Purpose |
+|--------|---------|
+| `lstm/save_test_samples.py` | Sample N test points with seed=2025 (shared across both methods) |
+| `lstm/export_relu_lstm_onnx.py` | Export ONNX (FlatWrapper pre-splits gate weights — onnxsim not required) |
+| `lstm/create_genbab_configs.py` | Generate GenBaB yaml configs |
+| `lstm/auto_test_genbab_mnist.py` | Run α,β-CROWN sweep and collect wall-clock timing |
+| `lstm/parse_genbab_results.py` | Parse results into `lstm/genbab_results.xlsx` |
 
-**執行順序**：
+**Execution order:**
 
 ```bash
 python lstm/save_test_samples.py
@@ -269,11 +267,10 @@ python lstm/auto_test_genbab_mnist.py
 python lstm/parse_genbab_results.py
 ```
 
-GenBaB 認證分兩階段：CROWN（快但鬆）→ BaB（慢但緊）。結果欄位：
-- `genbab_crown_only`：CROWN 單獨成功的樣本數
-- `genbab_bab_rescued`：BaB 救回的樣本數（CROWN 失敗後 BaB 成功）
-- `genbab_n_unknown`：timeout / 未知
-- `genbab_cert_pct`：總認證率%
+GenBaB certifies in two stages: CROWN (fast, loose) → BaB (slow, tight). Output columns:
+- `genbab_crown_only`: samples certified by CROWN alone
+- `genbab_bab_rescued`: samples where BaB succeeded after CROWN failed
+- `genbab_n_unknown`: timeout / inconclusive
+- `genbab_cert_pct`: overall certification rate (%)
 
-> 計時：`avg_crown_ms`、`avg_bab_ms` 分母是「CROWN 失敗子集」；`avg_total_ms` 分母是全體 N，三者不能直接相加。
-
+> ⚠️ `avg_crown_ms` and `avg_bab_ms` are averaged over the CROWN-failed subset; `avg_total_ms` is averaged over all N samples — the three columns use different denominators and cannot be summed.
