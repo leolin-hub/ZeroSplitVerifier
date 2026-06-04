@@ -81,6 +81,21 @@ Replace `python` with the full path to your environment's interpreter as needed.
 
 ---
 
+## 環境與執行慣例
+
+- Python 環境：conda `torch-env`。兩種用法擇一：
+  - 先啟動：`conda activate torch-env`（tmux 多 window 並行建議採此）
+  - 直接指定：`$PYTHON_BIN` 環境變數（見下）
+- **所有指令從 repo 根目錄執行**（auto_test 腳本以相對路徑呼叫 verifier，cwd 須是 repo 根）
+
+> `auto_test_*.py` 支援兩個環境變數覆寫：
+> - `PYTHON_BIN`：指定 Python 直譯器路徑，預設 `sys.executable`（當前環境）
+> - `MODEL_ROOT`：模型根目錄，預設 `../models`
+>
+> 範例：`MODEL_ROOT=/home/user/models PYTHON_BIN=/path/to/python python vanilla_rnn/auto_test_zs_mnist.py`
+
+---
+
 ## Training
 
 ### Vanilla RNN
@@ -155,12 +170,68 @@ Additional LSTM arguments:
 | Argument | Description |
 |----------|-------------|
 | `--lut-dir` | Directory with pre-built branching point LUTs |
+| `--relu` | Use ReLU-LSTM (relu(yg), identity output) — required for GenBaB comparison |
+| `--pq-only` | Run POPQORN bound only, skip ZeroSplit |
 | `--gate-filter` | Restrict splits to specific gates, e.g. `g` or `g,i` |
 
 ### Toy RNN (Sanity Check)
 
 ```bash
 python vanilla_rnn/rnn_zerosplit_verifier.py --toy-rnn --max-splits 2
+```
+
+---
+
+## 批次掃描（Auto Test）
+
+每條實驗線都是「核心 verifier + 外層 auto_test 掃描器」。每個 `auto_test_*.py` 支援：
+- `--timestep N`：只跑這個 timestep（tmux 多 window 並行設計）
+- `--resume`：從最新 `auto_test_results_*/progress.json` 跳過已完成項
+
+### Vanilla RNN
+
+| 資料集 | 腳本 | timesteps | hidden |
+|--------|------|-----------|--------|
+| MNIST | `vanilla_rnn/auto_test_zs_mnist.py` | 1,2,4,7 | 4,8,16,32 |
+| MNIST sequential | `vanilla_rnn/auto_test_seq.py` | 50 | 16,32,64,128 |
+| CIFAR-10 | `vanilla_rnn/auto_test_cifar10.py` | 8 | 16,32,64,128 |
+
+### LSTM（MNIST）
+
+```bash
+python lstm/auto_test_mnist_lstm.py --timestep {1,2,4,7}
+```
+
+hidden `[4,8,16,32]` × timesteps `[1,2,4,7]`，eps 0.01–0.3
+
+### tmux 四 window 並行
+
+```bash
+conda activate torch-env
+tmux new-session -d -s rnn -c /path/to/POPQORN     # window 0
+tmux new-window  -t rnn                             # windows 1-3
+tmux send-keys -t rnn:0 "python vanilla_rnn/auto_test_zs_mnist.py --timestep 1" C-m
+tmux send-keys -t rnn:1 "python vanilla_rnn/auto_test_zs_mnist.py --timestep 2" C-m
+tmux send-keys -t rnn:2 "python vanilla_rnn/auto_test_zs_mnist.py --timestep 4" C-m
+tmux send-keys -t rnn:3 "python vanilla_rnn/auto_test_zs_mnist.py --timestep 7" C-m
+tmux attach -t rnn
+```
+
+> 4 window × `--n-workers 4` = 16 個 process，請依 CPU 核心數調整。
+
+---
+
+## 結果解析
+
+每個 verifier 跑完在 `--save-dir` 下寫 JSON（含 `experiment_info`、`evr_summary`、`timing_stats`、`sample_records`）：
+- RNN：`evr_results/session_rnn_{act}_hidden{hs}_ts{ts}_p{p}/evr_rnn_*.json`
+- LSTM：`lstm/evr_results/session_lstm_hidden{hs}_ts{ts}_p{p}/evr_lstm_*.json`
+
+**解析成 Excel**：
+
+```bash
+python vanilla_rnn/parse_evr.py          # RNN（路徑寫在 __main__）
+python lstm/parse_evr_lstm.py --input-dir ./lstm/evr_results --output evr_lstm_summary.xlsx
 ```
 
 ---
@@ -172,4 +243,37 @@ python vanilla_rnn/rnn_zerosplit_verifier.py --toy-rnn --max-splits 2
 | `pq_all_pass` | Baseline certified at all eps; ZeroSplit never ran |
 | `zs_better` | Baseline failed at some eps, ZeroSplit succeeded — refinement helped |
 | `both_fail` | Both baseline and ZeroSplit failed up to eps_max |
+
+---
+
+## 附錄：GenBaB（α,β-CROWN）比較
+
+比較對象：LSTM on MNIST，hidden `[4,8,16,32]` × timestep `[1,2,4,7]`，N=50，L2 norm，CPU only。
+GenBaB 安裝在獨立 repo（非本 repo 範圍）；橋接腳本在 `lstm/`：
+
+| 腳本 | 用途 |
+|------|------|
+| `lstm/save_test_samples.py` | 以 seed=2025 抽樣，存共用樣本（確保兩邊測同一批）|
+| `lstm/export_relu_lstm_onnx.py` | 匯出 ONNX（FlatWrapper 預切 gate 權重，不需 onnxsim）|
+| `lstm/create_genbab_configs.py` | 產生 GenBaB yaml config |
+| `lstm/auto_test_genbab_mnist.py` | 呼叫 α,β-CROWN 掃描，收集 wall-clock 計時 |
+| `lstm/parse_genbab_results.py` | 解析結果成 `lstm/genbab_results.xlsx` |
+
+**執行順序**：
+
+```bash
+python lstm/save_test_samples.py
+python lstm/export_relu_lstm_onnx.py
+python lstm/create_genbab_configs.py
+python lstm/auto_test_genbab_mnist.py
+python lstm/parse_genbab_results.py
+```
+
+GenBaB 認證分兩階段：CROWN（快但鬆）→ BaB（慢但緊）。結果欄位：
+- `genbab_crown_only`：CROWN 單獨成功的樣本數
+- `genbab_bab_rescued`：BaB 救回的樣本數（CROWN 失敗後 BaB 成功）
+- `genbab_n_unknown`：timeout / 未知
+- `genbab_cert_pct`：總認證率%
+
+> 計時：`avg_crown_ms`、`avg_bab_ms` 分母是「CROWN 失敗子集」；`avg_total_ms` 分母是全體 N，三者不能直接相加。
 
