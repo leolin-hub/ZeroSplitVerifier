@@ -20,6 +20,7 @@ lstm/evr_results_genbab/
 lstm/genbab_results.xlsx
 lstm/test_samples/
 # 內部文件
+CLAUDE.md
 HANDOFF_FOR_PUSH.md
 output_pdf.txt
 *.swp
