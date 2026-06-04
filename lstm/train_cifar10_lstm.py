@@ -61,8 +61,8 @@ def evaluate(model, loader, device):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train LSTM CIFAR-10 Classifier')
-    parser.add_argument('--hidden-size', default=16, type=int, metavar='HS')
-    parser.add_argument('--time-step', default=4, type=int, metavar='TS')
+    parser.add_argument('--hidden-size', default=64, type=int, metavar='HS')
+    parser.add_argument('--time-step', default=1, type=int, metavar='TS')
     parser.add_argument('--use-rgb', default=True, type=bool)
     parser.add_argument('--dropout', default=0.5, type=float)
     parser.add_argument('--data-dir', default='./data', type=str)

@@ -625,8 +625,8 @@ class My_lstm(nn.Module):
                     maximum = maximum + mat_mul(A_fc_delta, self.c0)
                     minimum = minimum + mat_mul(Ou_fc_theta, self.c0)
                     
-            self.c_l[v-1] = minimum
-            self.c_u[v-1] = maximum
+            self.c_l[v-1] = torch.min(minimum, maximum)
+            self.c_u[v-1] = torch.max(minimum, maximum)
             # print(maximum-minimum)
             
             

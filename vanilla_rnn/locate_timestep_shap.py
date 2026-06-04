@@ -346,7 +346,7 @@ _DATASET_CFGS = {
         'num_classes':    10,
     },
     'mnist_seq': {
-        'base_model_dir': './models/mnist_seq_classifier/',
+        'base_model_dir': '../models/mnist_seq_classifier/',
         'model_prefix':   'rnn_seq',
         'data_dir':       './data/mnist_seq/sequences/',
         'input_size_fn':  lambda ts: 3,
@@ -429,7 +429,7 @@ if __name__ == "__main__":
 
     ALL_DATASETS = {
         'cifar10':   {'timesteps': [8, 12, 24, 32],  'hidden_sizes': [16, 32, 64, 128], 'activations': ['relu', 'tanh']},
-        'mnist_seq': {'timesteps': [35, 40, 45, 50], 'hidden_sizes': [16, 32, 64, 128], 'activations': ['relu', 'tanh']},
+        'mnist_seq': {'timesteps': [30, 35, 40, 45, 50], 'hidden_sizes': [16, 32, 64, 128], 'activations': ['relu', 'tanh']},
     }
 
     parser = argparse.ArgumentParser()

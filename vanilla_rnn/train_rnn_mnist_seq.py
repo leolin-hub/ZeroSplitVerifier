@@ -95,7 +95,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--hidden-size', default=64, type=int)
-    parser.add_argument('--time-step', default=70, type=int, 
+    parser.add_argument('--time-step', default=55, type=int, 
                         help='max sequence length to use')
     parser.add_argument('--activation', default='tanh', type=str)
     parser.add_argument('--data-dir', default='./data/mnist_seq/sequences/', type=str)

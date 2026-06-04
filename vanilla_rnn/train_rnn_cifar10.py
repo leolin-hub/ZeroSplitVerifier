@@ -78,8 +78,8 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--hidden-size', default=64, type=int)
-    parser.add_argument('--time-step', default=32, type=int)
+    parser.add_argument('--hidden-size', default=16, type=int)
+    parser.add_argument('--time-step', default=8, type=int)
     parser.add_argument('--activation', default='relu', type=str)
     parser.add_argument('--data-dir', default='./data', type=str)
     parser.add_argument('--save-dir', default='../models/cifar10_classifier/', type=str)
