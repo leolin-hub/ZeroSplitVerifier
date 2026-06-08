@@ -13,7 +13,7 @@ This repository implements an **abstraction-refinement (ZeroSplit)** verificatio
 | Network | Activation | Splitting target | Optimal branching |
 |---------|-----------|-----------------|-------------------|
 | Vanilla RNN | ReLU / tanh | Hidden state pre-activation (single scalar) | Fixed at 0 |
-| LSTM *(Ongoing Work)* | Sigmoid / tanh | Gate pre-activation (one of i/f/g/o) | Pre-computed p* via LUT |
+| LSTM | Sigmoid / tanh | Gate pre-activation (one of i/f/g/o) | Pre-computed p* via LUT |
 
 The key idea in both cases is **ZeroSplit**: identify neurons whose pre-activation interval crosses zero (worst case for linear relaxation), split the interval into a negative branch and a positive branch, certify each branch independently with tighter bounds, and return `verified` only when both branches succeed.
 
@@ -50,7 +50,7 @@ For **LSTM**, the optimal split point `p*` is looked up from a pre-built table (
 
 Rather than exhaustive search, SHAP values identify which `(timestep, neuron)` pairs contribute most to the output margin. The ranking is computed once per sample and reused throughout the DFS tree. Timesteps are visited in **temporal order** (non-decreasing) to ensure each split's downstream recomputation is minimal.
 
-### 4. Optimal Branching Point (LSTM only) *(Ongoing Work)*
+### 4. Optimal Branching Point (LSTM only)
 
 For LSTM gates with smooth activations (tanh, Sigmoid), splitting at zero is not optimal. The branching point optimizer pre-computes:
 
