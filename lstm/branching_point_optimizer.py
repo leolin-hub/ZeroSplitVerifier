@@ -178,6 +178,10 @@ def build_lookup_table_1d(
     loss_2d[i_idx, j_idx] = _segment_loss_vec(
         kl_f, bl_f, ku_f, bu_f, grid[i_idx], grid[j_idx]
     )
+    # Zero-width segment [g, g] has zero relaxation loss.  Needed so that
+    # "split at an endpoint" (p == l or p == u) evaluates to the full-interval
+    # loss — i.e. the no-split baseline — in Phase 3.
+    np.fill_diagonal(loss_2d, 0.0)
     print(f'[{activation}] Phase 2 done  {time.perf_counter()-t0:.1f}s')
 
     # ------------------------------------------------------------------
@@ -188,27 +192,29 @@ def build_lookup_table_1d(
 
     optimal_p = np.full((N, N), np.nan, dtype=np.float32)
 
-    # k == i+1: sub-interval is one grid step — no interior grid point exists.
-    # Fall back to midpoint; these pairs are handled by query_lookup_table_1d.
-    # (optimal_p[i, i+1] stays NaN; the query function returns midpoint for NaN.)
+    # For each interval [grid[i], grid[k]] (i < k) we minimise over candidate
+    # split points p ∈ {i, i+1, …, k} — endpoints INCLUDED.  Splitting at an
+    # endpoint (p == i or p == k) leaves one zero-width side, so its cost equals
+    # the full-interval loss: it is the "do not split this neuron" option, and
+    # wins exactly when no interior split reduces the total relaxation area.
+    #
+    # For fixed k, build a (k × (k+1)) cost matrix over rows i ∈ [0, k-1]:
+    #   total[i, p] = loss_2d[i, p] + loss_2d[p, k]
+    # Valid region: p >= i (p < i would be a reversed interval → inf).
+    for k in tqdm(range(1, N), desc=f'{activation}', unit='k'):
+        left  = loss_2d[:k, :k+1]                      # (k, k+1): left[i, p], p ∈ [0, k]
+        right = loss_2d[:k+1, k]                       # (k+1,):   right[p] = loss(p, k)
+        total = left + right[np.newaxis, :]            # (k, k+1): broadcast
 
-    # k >= i+2: at least one grid-aligned candidate p = grid[i+1..k-1] exists.
-    # For fixed k, build a (k × k) cost matrix:
-    #   total[i, p] = loss_2d[i, p]  +  loss_2d[p, k]
-    # Valid region: upper triangle (p > i).  Lower triangle → inf.
-    # Row argmin over [:k-1] rows gives best p for each i.
-    for k in tqdm(range(2, N), desc=f'{activation}', unit='k'):
-        left  = loss_2d[:k, :k]                        # (k, k): left[i, p]
-        right = loss_2d[:k, k]                         # (k,):   right[p]
-        total = left + right[np.newaxis, :]            # (k, k): broadcast
+        # Mask reversed intervals (p < i)
+        rows = np.arange(k)[:, None]
+        cols = np.arange(k + 1)[None, :]
+        total[cols < rows] = np.inf                    # in-place on the new array
 
-        # Mask invalid positions (p <= i, includes diagonal and lower triangle)
-        lower_tri = np.tril(np.ones((k, k), dtype=bool))
-        total[lower_tri] = np.inf                      # in-place on the new array
-
-        # argmin over columns → best p index for each row i in [0, k-2]
-        best_p_idx = np.argmin(total[:k-1], axis=1)   # (k-1,)
-        optimal_p[:k-1, k] = grid[best_p_idx].astype(np.float32)
+        # argmin over columns → best p index for each row i in [0, k-1];
+        # an endpoint index (i or k) means "no split is better".
+        best_p_idx = np.argmin(total, axis=1)          # (k,)
+        optimal_p[:k, k] = grid[best_p_idx].astype(np.float32)
 
     print(f'[{activation}] Phase 3 done  {time.perf_counter()-t0:.1f}s')
     print(f'[{activation}] Total build time: {time.perf_counter()-t_total:.1f}s')
@@ -245,18 +251,20 @@ def query_lookup_table_1d(table: dict, l: float, u: float) -> float:
     """
     Nearest-neighbour lookup in the pre-built table.
 
-    Returns p* ∈ (l, u).  Falls back to midpoint when:
-      - the table entry is NaN (k == i+1 pairs, or l >= u in grid)
-      - the stored p* is outside (l, u) due to rounding at grid boundaries
+    Returns p* ∈ [l, u].  Endpoints are valid results: p* == l or p* == u
+    means "do not split this neuron" — no interior split beats the full
+    interval.  Falls back to midpoint only when the entry is NaN (l >= u in
+    grid).  The result is clamped to [l, u] so an endpoint optimum survives
+    grid rounding at the query boundaries.
     """
     grid = table['l_grid']
     idx_l = int(np.argmin(np.abs(grid - l)))
     idx_u = int(np.argmin(np.abs(grid - u)))
 
     p = float(table['optimal_p'][idx_l, idx_u])
-    if np.isnan(p) or not (l < p < u):
+    if np.isnan(p):
         return (l + u) / 2.0
-    return p
+    return min(max(p, l), u)
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +375,7 @@ def test_correctness() -> None:
                                         bound_range=(-1.0, 1.0),
                                         step_size=0.1)
     p_q = query_lookup_table_1d(small_table, l=-0.8, u=0.7)
-    assert -0.8 < p_q < 0.7, f'query result {p_q} not in (-0.8, 0.7)'
+    assert -0.8 <= p_q <= 0.7, f'query result {p_q} not in [-0.8, 0.7]'
     print(f'  query(-0.8, 0.7) → p*={p_q:.4f}  OK')
 
     print('\n=== All tests passed ===\n')
