@@ -10,6 +10,7 @@ shap_test_output/
 *.pdf
 
 # 執行產物與暫時量測檔
+vanilla_rnn/timing_analysis.ipynb
 vanilla_rnn/shap_timing_*.xlsx
 shap_timing_*.xlsx
 evr_lstm_summary.xlsx
