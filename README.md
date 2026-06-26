@@ -94,6 +94,79 @@ pip install torch torchvision shap loguru tqdm
 
 ---
 
+## Reproducibility & Experiment Artifacts
+
+The trained models and the exact test samples used in the paper are **not tracked in git**:
+models live in a `models/` directory that is a *sibling* of this repo (referenced as `../models/`
+from `vanilla_rnn/` and `lstm/`), and `lstm/test_samples/` is git-ignored. They are distributed
+as **GitHub Release** assets so experiments can be reproduced without retraining.
+
+### 1. Download & placement
+
+Download the two zips from the Release and extract them like so:
+
+```
+<parent>/
+├── POPQORN/                      # this repo  ← extract popqorn_test_samples.zip here
+│   ├── lstm/test_samples/        #   relu-lstm .pt (also used by the GenBaB comparison)
+│   └── test_samples/             #   vanilla-RNN .pt snapshots
+└── models/                       # ← extract popqorn_models.zip here (becomes ../models/)
+```
+
+```bash
+# from the repo's parent directory
+unzip popqorn_models.zip                 # → ./models/...
+unzip popqorn_test_samples.zip -d POPQORN # → POPQORN/lstm/test_samples + POPQORN/test_samples
+```
+
+### 2. Models in the Release (paper grid)
+
+| Family | Dir / checkpoint | Grid |
+|--------|------------------|------|
+| Vanilla RNN — MNIST | `models/mnist_classifier/rnn_{ts}_{hs}_{act}/rnn` | ts {1,2,4,7} × hs {4,8,16,32} × act {relu,tanh} |
+| Vanilla RNN — CIFAR-10 | `models/cifar10_classifier/rnn_{ts}_{hs}_{act}/rnn` | ts {8,12,24,32} × hs {16,32,64,128} × act {relu,tanh} |
+| Vanilla RNN — MNIST stroke | `models/mnist_seq_classifier/rnn_seq_{ts}_{hs}_{act}/rnn` | ts {30,35,40,45} × hs {16,32,64,128} × act {relu,tanh} |
+| ReLU-LSTM — MNIST | `models/mnist_relu_lstm/relu_lstm_{ts}_{hs}/relu_lstm` | ts {1,2,4,7} × hs {4,8,16,32} |
+
+112 checkpoints total (32 + 32 + 32 + 16). The `mnist_relu_lstm` set is also required for the
+GenBaB comparison in the Appendix. CIFAR-10 models are trained on **RGB** input
+(`3072/ts`), so verification must pass `--use-rgb` (see Verification below).
+
+### 3. Random seed & sampling parameters
+
+All sampling is deterministic via a fixed **`seed = 2025`** set at import in every sampler —
+[`vanilla_rnn/utils/sample_data.py`](vanilla_rnn/utils/sample_data.py#L10-L13),
+[`sample_seq_mnist.py`](vanilla_rnn/utils/sample_seq_mnist.py#L11-L14),
+[`sample_cifar10.py`](vanilla_rnn/utils/sample_cifar10.py#L6-L9),
+[`sample_cifar10_lstm.py`](vanilla_rnn/utils/sample_cifar10_lstm.py#L6-L9).
+Reproducibility relies on this seed **plus** `shuffle=True` producing a deterministic DataLoader
+order; a fresh verifier process draws exactly `N` (default 50) samples. Passing `rnn=model`
+makes the sampler report correctly-predicted counts, and the target class is
+`target_label = (y + randint(1..9)) % 10`.
+
+| Dataset / verifier | Sampler |
+|--------------------|---------|
+| RNN MNIST | `sample_mnist_data` |
+| RNN MNIST stroke | `sample_seq_mnist_data` |
+| RNN CIFAR-10 | `sample_cifar10_data` |
+| ReLU-LSTM MNIST | `sample_mnist_data` |
+
+### 4. Regenerating the artifacts
+
+The Release bundle is produced by [`package_artifacts.py`](package_artifacts.py) (export `.pt`
+snapshots → collect the paper-grid model dirs → write both zips under `dist/`):
+
+```bash
+python package_artifacts.py                 # export samples + collect models + zip → dist/
+python package_artifacts.py --export-only    # only regenerate the .pt snapshots
+```
+
+Each `.pt` holds `{'X', 'labels', 'target_label'}` (relu-lstm also stores `X_flat` for VNN-LIB);
+re-running produces byte-identical files (seed 2025). The relu-lstm snapshots match
+[`lstm/save_test_samples.py`](lstm/save_test_samples.py) so POPQORN and GenBaB score identical points.
+
+---
+
 ## Training
 
 ### Vanilla RNN
@@ -149,6 +222,10 @@ Key arguments:
 | `--n-workers` | Parallel workers (default: `cpu_count`) |
 | `--save-dir` | Output directory for JSON results |
 
+> `--work-dir` must point at a model directory extracted from `popqorn_models.zip`
+> (e.g. `../models/cifar10_classifier/rnn_8_64_relu/`). For CIFAR-10 also pass `--use-rgb`,
+> since those models are trained on RGB input (`3072/ts`); see [Reproducibility](#reproducibility--experiment-artifacts).
+
 ### LSTM — EVR (Exact Verifiable Robustness) Mode
 
 ```bash
@@ -191,8 +268,8 @@ Each experiment line consists of a core verifier plus an outer `auto_test` drive
 | Dataset | Script | Timesteps | Hidden sizes |
 |---------|--------|-----------|--------------|
 | MNIST | `vanilla_rnn/auto_test_zs_mnist.py` | 1, 2, 4, 7 | 4, 8, 16, 32 |
-| MNIST sequential | `vanilla_rnn/auto_test_seq.py` | 50 | 16, 32, 64, 128 |
-| CIFAR-10 | `vanilla_rnn/auto_test_cifar10.py` | 8 | 16, 32, 64, 128 |
+| MNIST sequential | `vanilla_rnn/auto_test_seq.py` | 30, 35, 40, 45 | 16, 32, 64, 128 |
+| CIFAR-10 | `vanilla_rnn/auto_test_cifar10.py` | 8, 12, 24, 32 | 16, 32, 64, 128 |
 
 ### LSTM (MNIST)
 

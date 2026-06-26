@@ -20,6 +20,8 @@ lookup_tables/
 lstm/evr_results_genbab/
 lstm/genbab_results.xlsx
 lstm/test_samples/
+test_samples/
+dist/
 # 內部文件
 CLAUDE.md
 HANDOFF_FOR_PUSH.md
