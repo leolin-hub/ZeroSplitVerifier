@@ -103,20 +103,31 @@ as **GitHub Release** assets so experiments can be reproduced without retraining
 
 ### 1. Download & placement
 
-Download the two zips from the Release and extract them like so:
+Download both assets from the [`v1.0-artifacts` release](https://github.com/leolin-hub/ZeroSplitVerifier/releases/tag/v1.0-artifacts):
+
+| Asset | SHA-256 |
+|-------|---------|
+| [`models.zip`](https://github.com/leolin-hub/ZeroSplitVerifier/releases/download/v1.0-artifacts/models.zip) | `f9212f5a6d7273f2c73eec3f8394414ac1a163ab971345ee031bb8a6446409f6` |
+| [`test_samples.zip`](https://github.com/leolin-hub/ZeroSplitVerifier/releases/download/v1.0-artifacts/test_samples.zip) | `8a6c1b3d298216c124909c4dc410dc1afa632d26910c8e12ad4c41e03c3b8863` |
+
+Extract so that `models/` ends up as a *sibling* of the repo (`<repo>` = your clone's folder name):
 
 ```
 <parent>/
-├── POPQORN/                      # this repo  ← extract popqorn_test_samples.zip here
+├── <repo>/                       # this repo  ← extract test_samples.zip here
 │   ├── lstm/test_samples/        #   relu-lstm .pt (also used by the GenBaB comparison)
 │   └── test_samples/             #   vanilla-RNN .pt snapshots
-└── models/                       # ← extract popqorn_models.zip here (becomes ../models/)
+└── models/                       # ← extract models.zip here (becomes ../models/)
 ```
 
 ```bash
 # from the repo's parent directory
-unzip popqorn_models.zip                 # → ./models/...
-unzip popqorn_test_samples.zip -d POPQORN # → POPQORN/lstm/test_samples + POPQORN/test_samples
+sha256sum -c <<'SUMS'
+f9212f5a6d7273f2c73eec3f8394414ac1a163ab971345ee031bb8a6446409f6  models.zip
+8a6c1b3d298216c124909c4dc410dc1afa632d26910c8e12ad4c41e03c3b8863  test_samples.zip
+SUMS
+unzip models.zip                  # → ./models/...
+unzip test_samples.zip -d <repo>   # → <repo>/lstm/test_samples + <repo>/test_samples
 ```
 
 ### 2. Models in the Release (paper grid)
@@ -222,7 +233,7 @@ Key arguments:
 | `--n-workers` | Parallel workers (default: `cpu_count`) |
 | `--save-dir` | Output directory for JSON results |
 
-> `--work-dir` must point at a model directory extracted from `popqorn_models.zip`
+> `--work-dir` must point at a model directory extracted from `models.zip`
 > (e.g. `../models/cifar10_classifier/rnn_8_64_relu/`). For CIFAR-10 also pass `--use-rgb`,
 > since those models are trained on RGB input (`3072/ts`); see [Reproducibility](#reproducibility--experiment-artifacts).
 
