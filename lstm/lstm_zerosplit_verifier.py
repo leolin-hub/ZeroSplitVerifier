@@ -16,6 +16,21 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+
+def initialize_multiprocessing():
+    """非 Windows 強制 spawn，並將數值庫執行緒數壓到 1。
+
+    NUMBA_NUM_THREADS 須在 numba 首次 import 前設定才有效；numba 於 worker
+    內（locate_neuron_lstm）才 import，故 spawn 的全新 process 中此順序成立
+    （切勿把 numba import 提前到檔案頂端，否則此行失效）。
+    """
+    for var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS',
+                'OPENBLAS_NUM_THREADS', 'NUMBA_NUM_THREADS'):
+        os.environ[var] = '1'
+    if sys.platform != 'win32':
+        mp.set_start_method('spawn', force=True)
+
+
 import torch
 import torch.nn as nn
 from loguru import logger
@@ -843,4 +858,5 @@ def main():
 
 
 if __name__ == '__main__':
+    initialize_multiprocessing()   # 先設定 start method，再進 main
     main()

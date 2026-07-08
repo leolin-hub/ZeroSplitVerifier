@@ -18,6 +18,16 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+def initialize_multiprocessing():
+    """非 Windows 強制 spawn，並將數值庫執行緒數壓到 1。"""
+    import multiprocessing as mp
+    for var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS'):
+        os.environ[var] = '1'
+    if sys.platform != 'win32':
+        mp.set_start_method('spawn', force=True)
+
+
 import torch
 import types
 import argparse
@@ -934,4 +944,5 @@ def main():
 
 
 if __name__ == '__main__':
+    initialize_multiprocessing()   # 先設定 start method，再進 main
     main()
