@@ -7,7 +7,7 @@ import json
 import time
 
 TEST_CONFIG = {
-    'hidden_sizes': [32],
+    'hidden_sizes': [16, 32, 64, 128],
     'timesteps': [8, 12, 24, 32],
     'activations': ['relu', 'tanh'],
     'dataset': 'cifar10',

@@ -8,17 +8,25 @@ import time
 
 # 測試參數配置
 TEST_CONFIG = {
-    'hidden_sizes': [16, 32, 64],
-    'timesteps': [2, 7],
-    'activations': ['tanh'],
+    'hidden_sizes': [4, 8, 16, 32],
+    'timesteps': [1, 2, 4, 7],
+    'activations': ['relu', 'tanh'],
     'base_work_dir': os.path.join(os.environ.get('MODEL_ROOT', '../models'), 'mnist_classifier') + '/',
     'N': 50,
     'p_values': [2],
-    'eps_values': [0.03, 0.05, 0.1],
-    'max_splits_map': {2: 2, 7: 7},
-    # 'max_splits_map': {2: 1, 7: 1},
+    'eps_min': 0.005,
+    'eps_max': 0.1,
+    'eps_step': 0.001,
+    'max_splits_map': {1: 1, 2: 2, 4: 4, 7: 7},
     'modes': ['shap'] # , 'max_violation'
 }
+
+# eps 掃描：0.005 → 0.1（含）step 0.001
+TEST_CONFIG['eps_values'] = [
+    round(TEST_CONFIG['eps_min'] + i * TEST_CONFIG['eps_step'], 6)
+    for i in range(round((TEST_CONFIG['eps_max'] - TEST_CONFIG['eps_min'])
+                         / TEST_CONFIG['eps_step']) + 1)
+]
 
 def get_work_dir(timestep, hidden_size, activation):
     return f"{TEST_CONFIG['base_work_dir']}rnn_{timestep}_{hidden_size}_{activation}/"

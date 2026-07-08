@@ -7,16 +7,16 @@ import json
 import time
 
 TEST_CONFIG = {
-    'hidden_sizes': [64],
-    'timesteps': [50],
-    'activations': ['tanh'],
+    'hidden_sizes': [16, 32, 64, 128],
+    'timesteps': [30, 35, 40, 45],
+    'activations': ['relu', 'tanh'],
     'dataset': 'mnist-seq',
     'base_work_dir': os.path.join(os.environ.get('MODEL_ROOT', '../models'), 'mnist_seq_classifier') + '/',
     'N': 50,
     'p_values': [2],
-    'eps_min': 0.010,
-    'eps_max': 0.020,
-    'max_splits_map': {50: 50},
+    'eps_min': 0.005,
+    'eps_max': 0.1,
+    'max_splits_map': {30: 30, 35: 35, 40: 40, 45: 45},
     'save_dir': './evr_results',
 }
 
